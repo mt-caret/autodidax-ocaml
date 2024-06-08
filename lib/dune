@@ -1,0 +1,7 @@
+(library
+ (public_name autodidax_ocaml)
+ (name autodidax_ocaml)
+ (libraries core core_kernel.nonempty_list)
+ (inline_tests)
+ (preprocess
+  (pps ppx_jane)))
