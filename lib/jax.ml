@@ -9,6 +9,8 @@ module Primitive = struct
     | Sub
     | Mul
   [@@deriving sexp]
+
+  let to_string t = sexp_of_t t |> Sexp.to_string |> String.lowercase
 end
 
 module type Interpreter_level = sig
@@ -18,10 +20,19 @@ module type Interpreter_level = sig
   val global_data : global_data
 end
 
+module Shaped_array = struct
+  type t = { dims : int array } [@@deriving sexp, compare]
+end
+
 module Abstract_value = struct
   type t =
-    | Shaped_array of { dims : int array }
+    | Shaped_array of Shaped_array.t
     | Concrete_array of Tensor.t
+
+  let shaped_array = function
+    | Shaped_array shaped_array -> shaped_array
+    | Concrete_array t -> { dims = Tensor.dims t }
+  ;;
 
   let dims = function
     | Shaped_array { dims } -> dims
@@ -94,35 +105,60 @@ end = struct
 end
 
 and Value : sig
-  type t =
-    | Tensor of Tensor.t
-    | Tracer of Packed_tracer.t
-  [@@deriving sexp_of]
+  type t [@@deriving sexp_of]
+
+  module Id : Comparable.S
+
+  module Hide_id : sig
+    type nonrec t = t [@@deriving sexp_of]
+  end
 
   val of_float : float -> t
+  val of_tensor : Tensor.t -> t
+  val of_tracer : Packed_tracer.t -> t
+  val get : t -> [ `Tensor of Tensor.t | `Tracer of Packed_tracer.t ]
+  val id : t -> Id.t
   val get_aval : t -> Abstract_value.t
   val find_top_interpreter : t Nonempty_list.t -> Packed_interpreter.t option
   val full_lower : t -> t
   val full_raise : ('tracer, _) Interpreter.t -> t -> 'tracer
 end = struct
+  module Id = Id.Make (struct
+      let name = "Jax.Value"
+    end)
+
   type t =
-    | Tensor of Tensor.t
-    | Tracer of Packed_tracer.t
+    { id : Id.t
+    ; value : [ `Tensor of Tensor.t | `Tracer of Packed_tracer.t ]
+    }
   [@@deriving sexp_of]
 
-  let of_float f = Tensor (Tensor.of_float f)
+  module Hide_id = struct
+    type nonrec t = t
+
+    let sexp_of_t t =
+      [%sexp_of: [ `Tensor of Tensor.t | `Tracer of Packed_tracer.t ]] t.value
+    ;;
+  end
+
+  let of_tensor tensor = { id = Id.create (); value = `Tensor tensor }
+  let of_float f = of_tensor (Tensor.of_float f)
+  let of_tracer tracer = { id = Id.create (); value = `Tracer tracer }
+  let get t = t.value
+  let id t = t.id
 
   let get_aval t =
-    match t with
-    | Tensor t -> Abstract_value.Concrete_array t
-    | Tracer (T { tracer; interpreter = (module Interpreter) }) ->
+    match get t with
+    | `Tensor t -> Abstract_value.Concrete_array t
+    | `Tracer (T { tracer; interpreter = (module Interpreter) }) ->
       Interpreter.Tracer.aval tracer
   ;;
 
   let find_top_interpreter values =
-    Nonempty_list.filter_map values ~f:(function
-      | Tensor _ -> None
-      | Tracer packed_tracer -> Some packed_tracer)
+    Nonempty_list.filter_map values ~f:(fun value ->
+      match get value with
+      | `Tensor _ -> None
+      | `Tracer packed_tracer -> Some packed_tracer)
     |> List.max_elt
          ~compare:
            (Comparable.lift
@@ -135,9 +171,10 @@ end = struct
       Packed_interpreter.T interpreter)
   ;;
 
-  let full_lower = function
-    | Tensor t -> Tensor t
-    | Tracer (T { tracer; interpreter = (module Interpreter) }) ->
+  let full_lower t =
+    match get t with
+    | `Tensor _ -> t
+    | `Tracer (T { tracer; interpreter = (module Interpreter) }) ->
       Interpreter.Tracer.full_lower tracer
   ;;
 
@@ -147,9 +184,9 @@ end = struct
     t
     : tracer
     =
-    match t with
-    | Tensor t -> Interpreter.pure t
-    | Tracer (T { tracer; interpreter = (module Interpreter_to_lift) } as packed_tracer)
+    match get t with
+    | `Tensor t -> Interpreter.pure t
+    | `Tracer (T { tracer; interpreter = (module Interpreter_to_lift) } as packed_tracer)
       ->
       (match
          Ordering.of_int (compare Interpreter.Level.level Interpreter_to_lift.Level.level)
@@ -219,7 +256,7 @@ let eval_interpreter ~level : (Tensor.t, unit) Interpreter.t =
       type value = Value.t
 
       let aval t = Abstract_value.Concrete_array t
-      let full_lower t = Value.Tensor t
+      let full_lower t = Value.of_tensor t
     end
 
     module Level = struct
@@ -237,10 +274,10 @@ let eval_interpreter ~level : (Tensor.t, unit) Interpreter.t =
         [%message "Cannot lift in eval interpreter" (packed_tracer : Packed_tracer.t)]
     ;;
 
-    let process_primitive (prim : Primitive.t) (values : Tensor.t Nonempty_list.t)
+    let process_primitive (prim : Primitive.t) (tracers : Tensor.t Nonempty_list.t)
       : Tensor.t Nonempty_list.t
       =
-      match prim, values with
+      match prim, tracers with
       | Sin, [ t ] -> [ Tensor.sin t ]
       | Cos, [ t ] -> [ Tensor.cos t ]
       | Neg, [ t ] -> [ Tensor.( ~- ) t ]
@@ -250,7 +287,7 @@ let eval_interpreter ~level : (Tensor.t, unit) Interpreter.t =
       | _ ->
         raise_s
           [%message
-            "unexpected evaluation" (prim : Primitive.t) (values : _ Nonempty_list.t)]
+            "unexpected evaluation" (prim : Primitive.t) (tracers : _ Nonempty_list.t)]
     ;;
   end)
 ;;
@@ -263,7 +300,7 @@ let%expect_test "eval" =
     let z = -y + x in
     z
   in
-  Value.of_float 3. |> f |> [%sexp_of: Value.t] |> print_s;
+  Value.of_float 3. |> f |> [%sexp_of: Value.Hide_id.t] |> print_s;
   [%expect {| (Tensor 2.7177599838802657) |}]
 ;;
 
@@ -288,7 +325,7 @@ let jvp_interpreter ~level () : (Jvp_tracer.t, unit) Interpreter.t =
           let aval { Jvp_tracer.primal; tangent = _ } = Value.get_aval primal
 
           let full_lower t =
-            Value.Tracer (T { tracer = t; interpreter = force interpreter })
+            Value.of_tracer (T { tracer = t; interpreter = force interpreter })
           ;;
         end
 
@@ -306,17 +343,20 @@ let jvp_interpreter ~level () : (Jvp_tracer.t, unit) Interpreter.t =
         let value_to_tracer value =
           { Jvp_tracer.primal = value
           ; tangent =
-              Tensor (Tensor.zeros ~dims:(Value.get_aval value |> Abstract_value.dims))
+              Value.of_tensor
+                (Tensor.zeros ~dims:(Value.get_aval value |> Abstract_value.dims))
           }
         ;;
 
-        let pure tensor = value_to_tracer (Tensor tensor)
-        let lift packed_tracer = value_to_tracer (Tracer packed_tracer)
+        let pure tensor = value_to_tracer (Value.of_tensor tensor)
+        let lift packed_tracer = value_to_tracer (Value.of_tracer packed_tracer)
 
-        let process_primitive (prim : Primitive.t) (values : Jvp_tracer.t Nonempty_list.t)
+        let process_primitive
+          (prim : Primitive.t)
+          (tracers : Jvp_tracer.t Nonempty_list.t)
           : Jvp_tracer.t Nonempty_list.t
           =
-          match prim, values with
+          match prim, tracers with
           | Sin, [ { primal = x; tangent = dx } ] ->
             [ { primal = sin x; tangent = cos x * dx } ]
           | Cos, [ { primal = x; tangent = dx } ] ->
@@ -331,7 +371,7 @@ let jvp_interpreter ~level () : (Jvp_tracer.t, unit) Interpreter.t =
           | _ ->
             raise_s
               [%message
-                "unexpected evaluation" (prim : Primitive.t) (values : _ Nonempty_list.t)]
+                "unexpected evaluation" (prim : Primitive.t) (tracers : _ Nonempty_list.t)]
         ;;
       end)
   in
@@ -346,7 +386,7 @@ let jvp ~f primals tangets =
       let tracers_in =
         Nonempty_list.zip_exn primals tangets
         |> Nonempty_list.map ~f:(fun (primal, tangent) ->
-          Value.Tracer (T { tracer = { Jvp_tracer.primal; tangent }; interpreter }))
+          Value.of_tracer (T { tracer = { Jvp_tracer.primal; tangent }; interpreter }))
       in
       let out = f tracers_in in
       let { Jvp_tracer.primal; tangent } = Value.full_raise interpreter out in
@@ -365,9 +405,9 @@ let jvp1 ~f primal tangent =
 let%expect_test "jvp" =
   let x = Value.of_float 3. in
   let dx = Value.of_float 1. in
-  jvp1 ~f:sin x dx |> [%sexp_of: Value.t * Value.t] |> print_s;
+  jvp1 ~f:sin x dx |> [%sexp_of: Value.Hide_id.t * Value.Hide_id.t] |> print_s;
   [%expect {| ((Tensor 0.14112000805986721) (Tensor -0.98999249660044542)) |}];
-  cos x |> [%sexp_of: Value.t] |> print_s;
+  cos x |> [%sexp_of: Value.Hide_id.t] |> print_s;
   [%expect {| (Tensor -0.98999249660044542) |}];
   let f x =
     let y = sin x * Value.of_float 2. in
@@ -376,15 +416,484 @@ let%expect_test "jvp" =
   in
   let x, dx = Value.of_float 3., Value.of_float 1. in
   let y, dy = jvp1 ~f x dx in
-  [%sexp_of: Value.t * Value.t] (y, dy) |> print_s;
+  [%sexp_of: Value.Hide_id.t * Value.Hide_id.t] (y, dy) |> print_s;
   [%expect {| ((Tensor 2.7177599838802657) (Tensor 2.9799849932008908)) |}];
   let deriv ~f x = jvp1 ~f x (Value.of_float 1.) |> snd in
-  deriv ~f:sin x |> [%sexp_of: Value.t] |> print_s;
+  deriv ~f:sin x |> [%sexp_of: Value.Hide_id.t] |> print_s;
   [%expect {| (Tensor -0.98999249660044542) |}];
-  deriv ~f:(deriv ~f:sin) x |> [%sexp_of: Value.t] |> print_s;
+  deriv ~f:(deriv ~f:sin) x |> [%sexp_of: Value.Hide_id.t] |> print_s;
   [%expect {| (Tensor -0.14112000805986721) |}];
-  deriv ~f:(deriv ~f:(deriv ~f:sin)) x |> [%sexp_of: Value.t] |> print_s;
+  deriv ~f:(deriv ~f:(deriv ~f:sin)) x |> [%sexp_of: Value.Hide_id.t] |> print_s;
   [%expect {| (Tensor 0.98999249660044542) |}];
-  deriv ~f:(deriv ~f:(deriv ~f:(deriv ~f:sin))) x |> [%sexp_of: Value.t] |> print_s;
+  deriv ~f:(deriv ~f:(deriv ~f:(deriv ~f:sin))) x
+  |> [%sexp_of: Value.Hide_id.t]
+  |> print_s;
   [%expect {| (Tensor 0.14112000805986721) |}]
+;;
+
+module Var : sig
+  module Id : sig
+    include Comparable.S
+
+    val to_int : t -> int
+  end
+
+  type t [@@deriving sexp, compare]
+
+  val create : Shaped_array.t -> t
+  val shaped_array : t -> Shaped_array.t
+  val id : t -> Id.t
+  val lookup : Id.t -> t
+end = struct
+  module Id = Id.Make (struct
+      let name = "Jax.Var"
+    end)
+
+  type t =
+    { shaped_array : Shaped_array.t
+    ; id : Id.t
+    }
+  [@@deriving sexp, compare]
+
+  let store = ref Id.Map.empty
+
+  let create shaped_array =
+    let t = { shaped_array; id = Id.create () } in
+    store := Map.add_exn !store ~key:t.id ~data:t;
+    t
+  ;;
+
+  let shaped_array t = t.shaped_array
+  let id t = t.id
+  let lookup id = Map.find_exn !store id
+end
+
+module Atom = struct
+  type t =
+    | Var of Var.t
+    | Lit of
+        (* Should this just have a Tensor.t inside? *)
+        
+        { value : Value.t
+        ; shaped_array : Shaped_array.t
+        }
+  [@@deriving sexp_of]
+
+  let lit value =
+    Lit { value; shaped_array = Value.get_aval value |> Abstract_value.shaped_array }
+  ;;
+end
+
+let abstract_eval (prim : Primitive.t) (inputs : Shaped_array.t Nonempty_list.t) =
+  let unary_op { Shaped_array.dims } = { Shaped_array.dims } in
+  let binary_op { Shaped_array.dims = dims1 } { Shaped_array.dims = dims2 } =
+    if [%compare.equal: int array] dims1 dims2
+    then { Shaped_array.dims = dims1 }
+    else raise_s [%message "Mismatched dims" (dims1 : int array) (dims2 : int array)]
+  in
+  match prim, inputs with
+  | Sin, [ x ] -> Nonempty_list.[ unary_op x ]
+  | Cos, [ x ] -> [ unary_op x ]
+  | Neg, [ x ] -> [ unary_op x ]
+  | Add, [ x1; x2 ] -> [ binary_op x1 x2 ]
+  | Sub, [ x1; x2 ] -> [ binary_op x1 x2 ]
+  | Mul, [ x1; x2 ] -> [ binary_op x1 x2 ]
+  | _ -> raise_s [%message "Unexpected primitive" (prim : Primitive.t)]
+;;
+
+module Jaxpr = struct
+  module Eqn = struct
+    type t =
+      { prim : Primitive.t
+      ; inputs : Atom.t Nonempty_list.t
+      ; out_binders : Var.t Nonempty_list.t
+      }
+    [@@deriving sexp_of]
+  end
+
+  module Type = struct
+    type t =
+      { in_types : Shaped_array.t Nonempty_list.t
+      ; out_types : Shaped_array.t Nonempty_list.t
+      }
+    [@@deriving sexp_of]
+  end
+
+  type t =
+    { in_binders : Var.t Nonempty_list.t
+    ; eqns : Eqn.t list
+    ; outs : Atom.t Nonempty_list.t
+    }
+  [@@deriving sexp_of]
+
+  let typecheck =
+    let typecheck_atom atom ~env =
+      match atom with
+      | Atom.Var var ->
+        if not (Set.mem env (Var.id var))
+        then
+          raise_s
+            [%message "Variable not found in env" (env : Var.Id.Set.t) (var : Var.t)];
+        Var.shaped_array var
+      | Lit { value = _; shaped_array } -> shaped_array
+    in
+    fun t ->
+      let { in_binders; eqns; outs } = t in
+      let env =
+        Nonempty_list.fold in_binders ~init:Var.Id.Set.empty ~f:(fun env var ->
+          match Set.mem env (Var.id var) with
+          | true ->
+            raise_s
+              [%message
+                "Duplicate variables found in in_binders"
+                  (env : Var.Id.Set.t)
+                  (var : Var.t)]
+          | false -> Set.add env (Var.id var))
+      in
+      let env =
+        List.fold eqns ~init:env ~f:(fun env eqn ->
+          let { Eqn.prim; inputs; out_binders } = eqn in
+          let input_types = Nonempty_list.map inputs ~f:(typecheck_atom ~env) in
+          let out_types = abstract_eval prim input_types in
+          Nonempty_list.zip_exn out_binders out_types
+          |> Nonempty_list.iter ~f:(fun (var, expected) ->
+            let actual = Var.shaped_array var in
+            if not ([%compare.equal: Shaped_array.t] actual expected)
+            then
+              raise_s
+                [%message
+                  "Mismatched output types"
+                    (actual : Shaped_array.t)
+                    (expected : Shaped_array.t)]);
+          Nonempty_list.fold out_binders ~init:env ~f:(fun env var ->
+            if Set.mem env (Var.id var)
+            then
+              raise_s
+                [%message
+                  "Duplicate variables found in out_binders"
+                    (env : Var.Id.Set.t)
+                    (var : Var.t)];
+            Set.add env (Var.id var)))
+      in
+      { Type.in_types = Nonempty_list.map in_binders ~f:Var.shaped_array
+      ; out_types = Nonempty_list.map outs ~f:(typecheck_atom ~env)
+      }
+  ;;
+
+  let eval t args =
+    let { in_binders; eqns; outs } = t in
+    let env =
+      Nonempty_list.zip_exn in_binders args
+      |> Nonempty_list.fold ~init:Var.Id.Map.empty ~f:(fun env (var, arg) ->
+        Map.add_exn env ~key:(Var.id var) ~data:arg)
+    in
+    let read_atom atom ~env =
+      match atom with
+      | Atom.Var var -> Map.find_exn env (Var.id var)
+      | Lit { value; shaped_array = _ } -> value
+    in
+    let env =
+      List.fold ~init:env eqns ~f:(fun env eqn ->
+        let { Eqn.prim; inputs; out_binders } = eqn in
+        let args = Nonempty_list.map inputs ~f:(read_atom ~env) in
+        let outs = bind prim args in
+        Nonempty_list.zip_exn out_binders outs
+        |> Nonempty_list.fold ~init:env ~f:(fun env (var, out) ->
+          Map.add_exn env ~key:(Var.id var) ~data:out))
+    in
+    Nonempty_list.map outs ~f:(read_atom ~env)
+  ;;
+
+  module Tracer = struct
+    module Id = Id.Make (struct
+        let name = "Jax.Jaxpr.Tracer"
+      end)
+
+    type t =
+      { shaped_array : Shaped_array.t
+      ; id : Id.t
+      }
+    [@@deriving sexp, compare]
+
+    let create shaped_array = { shaped_array; id = Id.create () }
+  end
+
+  module Builder = struct
+    type t =
+      { mutable eqns : Eqn.t list (* TODO: fix int? *)
+      ; mutable tracer_to_var : Var.t Tracer.Id.Map.t
+      ; mutable const_tracers : Tracer.t Value.Id.Map.t
+      ; mutable const_vals : Value.t Var.Id.Map.t
+      ; mutable tracers : Tracer.t list
+      }
+
+    let create () =
+      { eqns = []
+      ; tracer_to_var = Tracer.Id.Map.empty
+      ; const_tracers = Value.Id.Map.empty
+      ; const_vals = Var.Id.Map.empty
+      ; tracers = []
+      }
+    ;;
+
+    let new_tracer t shaped_array =
+      let tracer = Tracer.create shaped_array in
+      t.tracers <- t.tracers @ [ tracer ];
+      tracer
+    ;;
+
+    let add_eqn t eqn = t.eqns <- t.eqns @ [ eqn ]
+
+    let add_var t (tracer : Tracer.t) =
+      let var = Var.create tracer.shaped_array in
+      t.tracer_to_var <- Map.add_exn t.tracer_to_var ~key:tracer.id ~data:var;
+      var
+    ;;
+
+    let get_var t (tracer : Tracer.t) = Map.find_exn t.tracer_to_var tracer.id
+
+    let add_const t (tracer : Tracer.t) value =
+      let var = add_var t tracer in
+      t.const_tracers <- Map.set t.const_tracers ~key:(Value.id value) ~data:tracer;
+      t.const_vals <- Map.set t.const_vals ~key:(Var.id var) ~data:value;
+      var
+    ;;
+
+    (* 'a list -> 'a Nonempty_list.t -> 'a Nonempty_list.t *)
+    let ( @* ) list nonempty_list =
+      match list with
+      | [] -> nonempty_list
+      | x :: xs -> Nonempty_list.(x :: List.append xs (to_list nonempty_list))
+    ;;
+
+    let build t in_tracers out_tracers =
+      let { eqns; tracer_to_var; const_tracers = _; const_vals; tracers = _ } = t in
+      let const_vars = Map.keys const_vals in
+      let lookup_var (tracer : Tracer.t) = Map.find_exn tracer_to_var tracer.id in
+      let in_binders = Nonempty_list.map in_tracers ~f:lookup_var in
+      let t =
+        { in_binders = List.map const_vars ~f:Var.lookup @* in_binders
+        ; eqns
+        ; outs =
+            Nonempty_list.map out_tracers ~f:(fun tracer -> Atom.Var (lookup_var tracer))
+        }
+      in
+      ignore (typecheck t : Type.t);
+      (* Inline literals *)
+      let const_vals, literals =
+        Map.partition_map const_vals ~f:(fun value ->
+          match Value.get value with
+          | `Tracer _ -> First value
+          | `Tensor _ -> Second (Atom.lit value))
+      in
+      let inline_literals atom =
+        match atom with
+        | Atom.Var var -> Map.find literals (Var.id var) |> Option.value ~default:atom
+        | Lit _ -> atom
+      in
+      let const_vars, const_vals = Map.to_alist const_vals |> List.unzip in
+      let t =
+        { in_binders = List.map const_vars ~f:Var.lookup @* in_binders
+        ; eqns =
+            List.map eqns ~f:(fun eqn ->
+              { eqn with inputs = Nonempty_list.map eqn.inputs ~f:inline_literals })
+        ; outs = Nonempty_list.map t.outs ~f:inline_literals
+        }
+      in
+      ignore (typecheck t : Type.t);
+      t, const_vals
+    ;;
+  end
+
+  let to_string t =
+    let { in_binders; eqns; outs = _ } = t in
+    let var_to_string var =
+      let name =
+        let id = Var.id var |> Var.Id.to_int in
+        [%string "var_%{id#Int}"]
+      in
+      let type_ =
+        (Var.shaped_array var).dims
+        |> Array.to_list
+        |> List.map ~f:Int.to_string
+        |> String.concat ~sep:","
+      in
+      [%string "%{name}:[%{type_}]"]
+    in
+    let in_binders =
+      Nonempty_list.map in_binders ~f:var_to_string
+      |> Nonempty_list.to_list
+      |> String.concat ~sep:", "
+    in
+    let atom_to_string = function
+      | Atom.Var var -> var_to_string var
+      | Lit { value; shaped_array = _ } ->
+        [%sexp_of: Value.Hide_id.t] value |> Sexp.to_string
+    in
+    let eqns =
+      List.map eqns ~f:(fun { Eqn.prim; inputs; out_binders } ->
+        let lhs =
+          Nonempty_list.map out_binders ~f:var_to_string
+          |> Nonempty_list.to_list
+          |> String.concat ~sep:" "
+        in
+        let rhs =
+          let args =
+            Nonempty_list.map inputs ~f:atom_to_string
+            |> Nonempty_list.to_list
+            |> String.concat ~sep:" "
+          in
+          [%string "%{prim#Primitive} %{args}"]
+        in
+        [%string "%{lhs} = %{rhs}"])
+      |> String.concat ~sep:";\n  "
+    in
+    let outs =
+      Nonempty_list.map t.outs ~f:atom_to_string
+      |> Nonempty_list.to_list
+      |> String.concat ~sep:", "
+    in
+    [%string "lambda %{in_binders} .\nlet %{eqns}\nin %{outs}"]
+  ;;
+end
+
+let jaxpr_interpreter ~level (builder : Jaxpr.Builder.t)
+  : (Jaxpr.Tracer.t, Jaxpr.Builder.t) Interpreter.t
+  =
+  let rec interpreter : (Jaxpr.Tracer.t, Jaxpr.Builder.t) Interpreter.t lazy_t =
+    lazy
+      (module struct
+        type packed_tracer = Packed_tracer.t
+
+        module Tracer = struct
+          type t = Jaxpr.Tracer.t
+          type value = Value.t
+
+          let aval (t : Jaxpr.Tracer.t) = Abstract_value.Shaped_array t.shaped_array
+
+          let full_lower t =
+            Value.of_tracer (T { tracer = t; interpreter = force interpreter })
+          ;;
+        end
+
+        module Level = struct
+          type global_data = Jaxpr.Builder.t
+
+          let level = level
+          let global_data = builder
+        end
+
+        let tracer_witness =
+          Type_equal.Id.create ~name:"jaxpr_tracer" [%sexp_of: Jaxpr.Tracer.t]
+        ;;
+
+        let get_or_make_const_tracer (value : Value.t) =
+          match Map.find builder.const_tracers (Value.id value) with
+          | Some tracer -> tracer
+          | None ->
+            let dims = Value.get_aval value |> Abstract_value.dims in
+            let tracer = Jaxpr.Builder.new_tracer builder { Shaped_array.dims } in
+            let _ : Var.t = Jaxpr.Builder.add_const builder tracer value in
+            tracer
+        ;;
+
+        let pure tensor = get_or_make_const_tracer (Value.of_tensor tensor)
+        let lift packed_tracer = get_or_make_const_tracer (Value.of_tracer packed_tracer)
+
+        let process_primitive prim (tracers : Jaxpr.Tracer.t Nonempty_list.t) =
+          let shaped_arrays_in = Nonempty_list.map tracers ~f:(fun t -> t.shaped_array) in
+          let shaped_arrays_out = abstract_eval prim shaped_arrays_in in
+          let out_tracers =
+            Nonempty_list.map shaped_arrays_out ~f:(fun shaped_array ->
+              Jaxpr.Tracer.create shaped_array)
+          in
+          let inputs =
+            Nonempty_list.map tracers ~f:(fun tracer ->
+              Atom.Var (Jaxpr.Builder.get_var builder tracer))
+          in
+          let out_vars =
+            Nonempty_list.map out_tracers ~f:(Jaxpr.Builder.add_var builder)
+          in
+          Jaxpr.Builder.add_eqn builder { Jaxpr.Eqn.prim; inputs; out_binders = out_vars };
+          out_tracers
+        ;;
+      end)
+  in
+  force interpreter
+;;
+
+let new_arg
+  ((module Interpreter) : (Jaxpr.Tracer.t, Jaxpr.Builder.t) Interpreter.t)
+  shaped_array
+  =
+  let tracer = Jaxpr.Tracer.create shaped_array in
+  let builder = Interpreter.Level.global_data in
+  builder.tracer_to_var
+  <- Map.add_exn builder.tracer_to_var ~key:tracer.id ~data:(Var.create shaped_array);
+  tracer
+;;
+
+let make_jaxpr ~f args =
+  let builder = Jaxpr.Builder.create () in
+  new_interpreter
+    ~create_interpreter:jaxpr_interpreter
+    ~global_data:builder
+    ~f:(fun interpreter ->
+      let tracers_in = Nonempty_list.map args ~f:(new_arg interpreter) in
+      let outs =
+        Nonempty_list.map tracers_in ~f:(fun tracer ->
+          Value.of_tracer (Packed_tracer.T { tracer; interpreter }))
+        |> f
+      in
+      let tracers_out = Nonempty_list.map outs ~f:(Value.full_raise interpreter) in
+      let jaxpr, consts = Jaxpr.Builder.build builder tracers_in tracers_out in
+      jaxpr, consts)
+;;
+
+let make_jaxpr1 ~f arg =
+  make_jaxpr
+    ~f:(function
+      | Nonempty_list.[ x ] -> [ f x ]
+      | _ -> assert false)
+    [ arg ]
+;;
+
+let%expect_test "make_jaxpr" =
+  let jaxpr, values =
+    make_jaxpr1
+      ~f:(fun x -> Value.of_float 2. * x)
+      (Value.of_float 3. |> Value.get_aval |> Abstract_value.shaped_array)
+  in
+  print_s [%message "" (jaxpr : Jaxpr.t) (values : Value.t list)];
+  [%expect
+    {|
+    ((jaxpr
+      ((in_binders (((shaped_array ((dims ()))) (id (Jax.Var 0)))))
+       (eqns
+        (((prim Mul)
+          (inputs
+           ((Lit (value ((id (Jax.Value 373)) (value (Tensor 2))))
+             (shaped_array ((dims ()))))
+            (Var ((shaped_array ((dims ()))) (id (Jax.Var 0))))))
+          (out_binders (((shaped_array ((dims ()))) (id (Jax.Var 2))))))))
+       (outs ((Var ((shaped_array ((dims ()))) (id (Jax.Var 2))))))))
+     (values ())) |}];
+  Jaxpr.to_string jaxpr |> print_endline;
+  [%expect
+    {|
+      lambda var_0:[] .
+      let var_2:[] = mul (Tensor 2) var_0:[]
+      in var_2:[] |}];
+  Jaxpr.typecheck jaxpr |> [%sexp_of: Jaxpr.Type.t] |> print_s;
+  [%expect {| ((in_types (((dims ())))) (out_types (((dims ()))))) |}];
+  make_jaxpr1
+    ~f:(fun _ -> Value.of_float 2. * Value.of_float 2.)
+    (Value.of_float 3. |> Value.get_aval |> Abstract_value.shaped_array)
+  |> fst
+  |> Jaxpr.to_string
+  |> print_endline;
+  [%expect {|
+    lambda var_3:[] .
+    let
+    in (Tensor 4) |}]
 ;;
