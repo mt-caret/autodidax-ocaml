@@ -14,6 +14,7 @@ let item (t : t) =
 
 let get (t : t) index = Bigarray.Genarray.get t index
 let set (t : t) index value = Bigarray.Genarray.set t index value
+let fill (t : t) value = Bigarray.Genarray.fill t value
 
 let rec sexp_of_t t =
   match dims t with
@@ -45,6 +46,15 @@ let%expect_test "of_float" =
   [%sexp_of: t] t |> print_s;
   [%expect {| 5 |}]
 ;;
+
+let create ~dims value =
+  let t = create_uninitialized dims in
+  fill t value;
+  t
+;;
+
+let zeros ~dims = create ~dims 0.
+let ones ~dims = create ~dims 1.
 
 let arange n =
   let t = create_uninitialized [| n |] in
