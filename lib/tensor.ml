@@ -3,6 +3,7 @@ open! Core
 type t = (float, Bigarray.float64_elt, Bigarray.c_layout) Bigarray.Genarray.t
 
 let dims (t : t) = Bigarray.Genarray.dims t
+let num_dims (t : t) = Bigarray.Genarray.num_dims t
 let length (t : t) = dims t |> Array.fold ~init:1 ~f:( * )
 
 let item (t : t) =
@@ -39,6 +40,12 @@ let of_float f =
   t
 ;;
 
+let%expect_test "of_float" =
+  let t = of_float 5. in
+  [%sexp_of: t] t |> print_s;
+  [%expect {| 5 |}]
+;;
+
 let arange n =
   let t = create_uninitialized [| n |] in
   for i = 0 to n - 1 do
@@ -57,11 +64,14 @@ let%expect_test "arange" =
 ;;
 
 let map t ~f =
-  let t' = create_uninitialized [| length t |] in
-  for i = 0 to length t - 1 do
-    set t' [| i |] (f (get t [| i |]))
-  done;
-  reshape t' ~dims:(dims t)
+  match num_dims t with
+  | 0 -> get t [||] |> f |> of_float
+  | _ ->
+    let t' = create_uninitialized [| length t |] in
+    for i = 0 to length t - 1 do
+      set t' [| i |] (f (get t [| i |]))
+    done;
+    reshape t' ~dims:(dims t)
 ;;
 
 let map2 t1 t2 ~f =
@@ -71,11 +81,14 @@ let map2 t1 t2 ~f =
   then
     raise_s
       [%message "Tensor.map2: dims mismatch" (dims1 : int array) (dims2 : int array)];
-  let t = create_uninitialized [| length t1 |] in
-  for i = 0 to length t1 - 1 do
-    set t [| i |] (f (get t1 [| i |]) (get t2 [| i |]))
-  done;
-  reshape t ~dims:(dims t1)
+  match num_dims t1 with
+  | 0 -> f (get t1 [||]) (get t2 [||]) |> of_float
+  | _ ->
+    let t = create_uninitialized [| length t1 |] in
+    for i = 0 to length t1 - 1 do
+      set t [| i |] (f (get t1 [| i |]) (get t2 [| i |]))
+    done;
+    reshape t ~dims:(dims t1)
 ;;
 
 module O = struct
