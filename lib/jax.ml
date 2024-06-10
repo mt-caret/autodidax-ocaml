@@ -119,7 +119,6 @@ and Value : sig
   val get : t -> [ `Tensor of Tensor.t | `Tracer of Packed_tracer.t ]
   val id : t -> Id.t
   val get_aval : t -> Abstract_value.t
-  val find_top_interpreter : t Nonempty_list.t -> Packed_interpreter.t option
   val full_lower : t -> t
   val full_raise : ('tracer, _) Interpreter.t -> t -> 'tracer
 end = struct
@@ -152,23 +151,6 @@ end = struct
     | `Tensor t -> Abstract_value.Concrete_array t
     | `Tracer (T { tracer; interpreter = (module Interpreter) }) ->
       Interpreter.Tracer.aval tracer
-  ;;
-
-  let find_top_interpreter values =
-    Nonempty_list.filter_map values ~f:(fun value ->
-      match get value with
-      | `Tensor _ -> None
-      | `Tracer packed_tracer -> Some packed_tracer)
-    |> List.max_elt
-         ~compare:
-           (Comparable.lift
-              Int.compare
-              ~f:
-                (fun
-                  (Packed_tracer.T { tracer = _; interpreter = (module Interpreter) }) ->
-                Interpreter.Level.level))
-    |> Option.map ~f:(fun (Packed_tracer.T { tracer = _; interpreter }) ->
-      Packed_interpreter.T interpreter)
   ;;
 
   let full_lower t =
@@ -206,6 +188,34 @@ end = struct
 end
 
 let interpreter_stack : Packed_interpreter.t list ref = ref []
+let dynamic_interpreter : Packed_interpreter.t option ref = ref None
+
+let find_top_interpreter values =
+  let top_interpreter =
+    Nonempty_list.filter_map values ~f:(fun value ->
+      match Value.get value with
+      | `Tensor _ -> None
+      | `Tracer packed_tracer -> Some packed_tracer)
+    |> List.max_elt
+         ~compare:
+           (Comparable.lift
+              Int.compare
+              ~f:
+                (fun
+                  (Packed_tracer.T { tracer = _; interpreter = (module Interpreter) }) ->
+                Interpreter.Level.level))
+    |> Option.map ~f:(fun (Packed_tracer.T { tracer = _; interpreter }) ->
+      Packed_interpreter.T interpreter)
+    |> Option.value ~default:(List.last_exn !interpreter_stack)
+  in
+  match !dynamic_interpreter with
+  | None -> top_interpreter
+  | Some (Packed_interpreter.T (module Dynamic_interpreter) as dynamic_interpreter) ->
+    let (Packed_interpreter.T (module Top_interpreter)) = top_interpreter in
+    if Top_interpreter.Level.level > Dynamic_interpreter.Level.level
+    then top_interpreter
+    else dynamic_interpreter
+;;
 
 let new_interpreter
   (type tracer global_data)
@@ -221,11 +231,16 @@ let new_interpreter
     ~finally:(fun () -> interpreter_stack := List.tl_exn !interpreter_stack)
 ;;
 
+let new_dynamic_interpreter interpreter ~f =
+  let old_dynamic_interpreter = !dynamic_interpreter in
+  dynamic_interpreter := Some interpreter;
+  protect
+    ~f:(fun () -> f ())
+    ~finally:(fun () -> dynamic_interpreter := old_dynamic_interpreter)
+;;
+
 let bind prim values =
-  let (T interpreter) =
-    Value.find_top_interpreter values
-    |> Option.value ~default:(List.last_exn !interpreter_stack)
-  in
+  let (T interpreter) = find_top_interpreter values in
   let tracers =
     Nonempty_list.map values ~f:(fun value -> Value.full_raise interpreter value)
   in
@@ -839,15 +854,16 @@ let make_jaxpr ~f args =
     ~create_interpreter:jaxpr_interpreter
     ~global_data:builder
     ~f:(fun interpreter ->
-      let tracers_in = Nonempty_list.map args ~f:(new_arg interpreter) in
-      let outs =
-        Nonempty_list.map tracers_in ~f:(fun tracer ->
-          Value.of_tracer (Packed_tracer.T { tracer; interpreter }))
-        |> f
-      in
-      let tracers_out = Nonempty_list.map outs ~f:(Value.full_raise interpreter) in
-      let jaxpr, consts = Jaxpr.Builder.build builder tracers_in tracers_out in
-      jaxpr, consts)
+      new_dynamic_interpreter (Packed_interpreter.T interpreter) ~f:(fun () ->
+        let tracers_in = Nonempty_list.map args ~f:(new_arg interpreter) in
+        let outs =
+          Nonempty_list.map tracers_in ~f:(fun tracer ->
+            Value.of_tracer (Packed_tracer.T { tracer; interpreter }))
+          |> f
+        in
+        let tracers_out = Nonempty_list.map outs ~f:(Value.full_raise interpreter) in
+        let jaxpr, consts = Jaxpr.Builder.build builder tracers_in tracers_out in
+        jaxpr, consts))
 ;;
 
 let make_jaxpr1 ~f arg =
@@ -892,8 +908,9 @@ let%expect_test "make_jaxpr" =
   |> fst
   |> Jaxpr.to_string
   |> print_endline;
-  [%expect {|
+  [%expect
+    {|
     lambda var_3:[] .
-    let
-    in (Tensor 4) |}]
+    let var_6:[] = mul (Tensor 2) (Tensor 2)
+    in var_6:[] |}]
 ;;
