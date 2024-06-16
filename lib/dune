@@ -1,6 +1,6 @@
 (library
  (name autodidax_ocaml)
- (libraries core core_kernel.nonempty_list)
+ (libraries core core_kernel.nonempty_list core_unix xla)
  (inline_tests)
  (preprocess
   (pps ppx_jane)))

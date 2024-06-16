@@ -10,7 +10,7 @@ module type Operators = sig
 end
 
 module type Tensor = sig
-  type t [@@deriving sexp_of]
+  type t [@@deriving sexp_of, compare]
 
   val dims : t -> int array
   val length : t -> int
@@ -24,6 +24,8 @@ module type Tensor = sig
   val zeros : dims:int array -> t
   val ones : dims:int array -> t
   val arange : int -> t
+  val of_xla_literal : Xla.Literal.t -> t
+  val to_xla_literal : t -> Xla.Literal.t
   val map : t -> f:(float -> float) -> t
   val map2 : t -> t -> f:(float -> float -> float) -> t
 
