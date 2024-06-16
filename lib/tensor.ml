@@ -26,6 +26,27 @@ let rec sexp_of_t t =
     |> [%sexp_of: Sexp.t list]
 ;;
 
+(* TODO: I'm pretty sure this doesn't give you a meaningful total order, but
+   that's fine, we just use it for a binary search tree. *)
+let rec compare t1 t2 =
+  if [%compare.equal: int array] (dims t1) (dims t2)
+  then Comparable.lift [%compare: int array] ~f:dims t1 t2
+  else (
+    let compare =
+      match dims t1 with
+      | [||] -> Comparable.lift [%compare: float] ~f:item
+      | [| n |] ->
+        Comparable.lift [%compare: float list] ~f:(fun t ->
+          List.init n ~f:(fun i -> get t [| i |]))
+      | dims ->
+        let first_dim = dims.(0) in
+        List.init first_dim ~f:(fun i ->
+          Comparable.lift compare ~f:(fun t -> Bigarray.Genarray.slice_left t [| i |]))
+        |> Comparable.lexicographic
+    in
+    compare t1 t2)
+;;
+
 let create_uninitialized dims =
   Bigarray.Genarray.create Bigarray.float64 Bigarray.c_layout dims
 ;;
@@ -91,6 +112,8 @@ let%expect_test "xla" =
   print_s [%message "" (t : t)];
   [%expect {| (t 42) |}]
 ;;
+
+let to_xla_literal t = Xla.Literal.of_bigarray t
 
 let map t ~f =
   match num_dims t with

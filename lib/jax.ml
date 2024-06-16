@@ -1,18 +1,5 @@
 open! Core
 
-module Primitive = struct
-  type t =
-    | Sin
-    | Cos
-    | Neg
-    | Add
-    | Sub
-    | Mul
-  [@@deriving sexp]
-
-  let to_string t = sexp_of_t t |> Sexp.to_string |> String.lowercase
-end
-
 module type Interpreter_level = sig
   type global_data
 
@@ -22,6 +9,8 @@ end
 
 module Shaped_array = struct
   type t = { dims : int array } [@@deriving sexp, compare]
+
+  let of_tensor tensor = { dims = Tensor.dims tensor }
 end
 
 module Abstract_value = struct
@@ -46,6 +35,129 @@ module type Tracer = sig
 
   val aval : t -> Abstract_value.t
   val full_lower : t -> value
+end
+
+module Var : sig
+  module Id : sig
+    include Comparable.S
+
+    val to_int : t -> int
+    val to_string : t -> string
+  end
+
+  type t [@@deriving sexp, compare]
+
+  val create : Shaped_array.t -> t
+  val shaped_array : t -> Shaped_array.t
+  val id : t -> Id.t
+  val lookup : Id.t -> t
+end = struct
+  module Id = struct
+    include Id.Make (struct
+        let name = "Jax.Var"
+      end)
+
+    let to_string t =
+      let t = to_int t in
+      [%string "var_%{t#Int}"]
+    ;;
+  end
+
+  type t =
+    { shaped_array : Shaped_array.t
+    ; id : Id.t
+    }
+  [@@deriving sexp, compare]
+
+  let store = ref Id.Map.empty
+
+  let create shaped_array =
+    let t = { shaped_array; id = Id.create () } in
+    store := Map.add_exn !store ~key:t.id ~data:t;
+    t
+  ;;
+
+  let shaped_array t = t.shaped_array
+  let id t = t.id
+  let lookup id = Map.find_exn !store id
+end
+
+module Atom = struct
+  type t =
+    | Var of Var.t
+    | Lit of Tensor.t
+  [@@deriving sexp_of, compare]
+
+  let shaped_array = function
+    | Var var -> Var.shaped_array var
+    | Lit tensor -> Shaped_array.of_tensor tensor
+  ;;
+end
+
+module rec Primitive : sig
+  type t =
+    | Sin
+    | Cos
+    | Neg
+    | Add
+    | Sub
+    | Mul
+    | Xla_call of
+        { jaxpr : Jaxpr0.t
+        ; num_consts : int
+        }
+  [@@deriving sexp_of, compare]
+
+  val to_string : t -> string
+end = struct
+  type t =
+    | Sin
+    | Cos
+    | Neg
+    | Add
+    | Sub
+    | Mul
+    | Xla_call of
+        { jaxpr : Jaxpr0.t
+        ; num_consts : int
+        }
+  [@@deriving sexp_of, compare]
+
+  let to_string t = sexp_of_t t |> Sexp.to_string |> String.lowercase
+end
+
+and Jaxpr0 : sig
+  module Eqn : sig
+    type t =
+      { prim : Primitive.t
+      ; inputs : Atom.t Nonempty_list.t
+      ; out_binders : Var.t Nonempty_list.t
+      }
+    [@@deriving sexp_of, compare]
+  end
+
+  type t =
+    { in_binders : Var.t Nonempty_list.t
+    ; eqns : Eqn.t list
+    ; outs : Atom.t Nonempty_list.t
+    }
+  [@@deriving sexp_of, compare]
+end = struct
+  module Eqn = struct
+    type t =
+      { prim : Primitive.t
+      ; inputs : Atom.t Nonempty_list.t
+      ; out_binders : Var.t Nonempty_list.t
+      }
+    [@@deriving sexp_of, compare]
+  end
+
+  type t =
+    { in_binders : Var.t Nonempty_list.t
+    ; eqns : Eqn.t list
+    ; outs : Atom.t Nonempty_list.t
+    }
+  [@@deriving sexp_of, compare]
 end
 
 module type Interpreter0 = sig
@@ -261,6 +373,7 @@ let ( * ) t1 t2 = bind1 Primitive.Mul [ t1; t2 ]
 let ( ~- ) t = bind1 Primitive.Neg [ t ]
 let sin t = bind1 Primitive.Sin [ t ]
 let cos t = bind1 Primitive.Cos [ t ]
+let xla_callable' = Set_once.create ()
 
 let eval_interpreter ~level : (Tensor.t, unit) Interpreter.t =
   (module struct
@@ -299,6 +412,12 @@ let eval_interpreter ~level : (Tensor.t, unit) Interpreter.t =
       | Add, [ t1; t2 ] -> [ Tensor.( + ) t1 t2 ]
       | Sub, [ t1; t2 ] -> [ Tensor.( - ) t1 t2 ]
       | Mul, [ t1; t2 ] -> [ Tensor.( * ) t1 t2 ]
+      | Xla_call { jaxpr; num_consts }, args ->
+        let consts, args = List.split_n (Nonempty_list.to_list args) num_consts in
+        let callable =
+          (Set_once.get_exn xla_callable' [%here]) jaxpr consts |> Staged.unstage
+        in
+        callable (Nonempty_list.of_list_exn args)
       | _ ->
         raise_s
           [%message
@@ -446,59 +565,6 @@ let%expect_test "jvp" =
   [%expect {| (Tensor 0.14112000805986721) |}]
 ;;
 
-module Var : sig
-  module Id : sig
-    include Comparable.S
-
-    val to_int : t -> int
-  end
-
-  type t [@@deriving sexp, compare]
-
-  val create : Shaped_array.t -> t
-  val shaped_array : t -> Shaped_array.t
-  val id : t -> Id.t
-  val lookup : Id.t -> t
-end = struct
-  module Id = Id.Make (struct
-      let name = "Jax.Var"
-    end)
-
-  type t =
-    { shaped_array : Shaped_array.t
-    ; id : Id.t
-    }
-  [@@deriving sexp, compare]
-
-  let store = ref Id.Map.empty
-
-  let create shaped_array =
-    let t = { shaped_array; id = Id.create () } in
-    store := Map.add_exn !store ~key:t.id ~data:t;
-    t
-  ;;
-
-  let shaped_array t = t.shaped_array
-  let id t = t.id
-  let lookup id = Map.find_exn !store id
-end
-
-module Atom = struct
-  type t =
-    | Var of Var.t
-    | Lit of
-        (* Should this just have a Tensor.t inside? *)
-        
-        { value : Value.t
-        ; shaped_array : Shaped_array.t
-        }
-  [@@deriving sexp_of]
-
-  let lit value =
-    Lit { value; shaped_array = Value.get_aval value |> Abstract_value.shaped_array }
-  ;;
-end
-
 let abstract_eval (prim : Primitive.t) (inputs : Shaped_array.t Nonempty_list.t) =
   let unary_op { Shaped_array.dims } = { Shaped_array.dims } in
   let binary_op { Shaped_array.dims = dims1 } { Shaped_array.dims = dims2 } =
@@ -518,12 +584,12 @@ let abstract_eval (prim : Primitive.t) (inputs : Shaped_array.t Nonempty_list.t)
 
 module Jaxpr = struct
   module Eqn = struct
-    type t =
+    type t = Jaxpr0.Eqn.t =
       { prim : Primitive.t
       ; inputs : Atom.t Nonempty_list.t
       ; out_binders : Var.t Nonempty_list.t
       }
-    [@@deriving sexp_of]
+    [@@deriving sexp_of, compare]
   end
 
   module Type = struct
@@ -534,12 +600,12 @@ module Jaxpr = struct
     [@@deriving sexp_of]
   end
 
-  type t =
+  type t = Jaxpr0.t =
     { in_binders : Var.t Nonempty_list.t
     ; eqns : Eqn.t list
     ; outs : Atom.t Nonempty_list.t
     }
-  [@@deriving sexp_of]
+  [@@deriving sexp_of, compare]
 
   let typecheck =
     let typecheck_atom atom ~env =
@@ -550,7 +616,7 @@ module Jaxpr = struct
           raise_s
             [%message "Variable not found in env" (env : Var.Id.Set.t) (var : Var.t)];
         Var.shaped_array var
-      | Lit { value = _; shaped_array } -> shaped_array
+      | Lit tensor -> Shaped_array.of_tensor tensor
     in
     fun t ->
       let { in_binders; eqns; outs } = t in
@@ -605,7 +671,7 @@ module Jaxpr = struct
     let read_atom atom ~env =
       match atom with
       | Atom.Var var -> Map.find_exn env (Var.id var)
-      | Lit { value; shaped_array = _ } -> value
+      | Lit tensor -> Value.of_tensor tensor
     in
     let env =
       List.fold ~init:env eqns ~f:(fun env eqn ->
@@ -699,7 +765,7 @@ module Jaxpr = struct
         Map.partition_map const_vals ~f:(fun value ->
           match Value.get value with
           | `Tracer _ -> First value
-          | `Tensor _ -> Second (Atom.lit value))
+          | `Tensor tensor -> Second (Atom.Lit tensor))
       in
       let inline_literals atom =
         match atom with
@@ -723,10 +789,7 @@ module Jaxpr = struct
   let to_string t =
     let { in_binders; eqns; outs = _ } = t in
     let var_to_string var =
-      let name =
-        let id = Var.id var |> Var.Id.to_int in
-        [%string "var_%{id#Int}"]
-      in
+      let name = Var.id var |> Var.Id.to_string in
       let type_ =
         (Var.shaped_array var).dims
         |> Array.to_list
@@ -742,8 +805,7 @@ module Jaxpr = struct
     in
     let atom_to_string = function
       | Atom.Var var -> var_to_string var
-      | Lit { value; shaped_array = _ } ->
-        [%sexp_of: Value.Hide_id.t] value |> Sexp.to_string
+      | Lit tensor -> [%sexp_of: Tensor.t] tensor |> Sexp.to_string
     in
     let eqns =
       List.map eqns ~f:(fun { Eqn.prim; inputs; out_binders } ->
@@ -887,19 +949,18 @@ let%expect_test "make_jaxpr" =
       ((in_binders (((shaped_array ((dims ()))) (id (Jax.Var 0)))))
        (eqns
         (((prim Mul)
-          (inputs
-           ((Lit (value ((id (Jax.Value 373)) (value (Tensor 2))))
-             (shaped_array ((dims ()))))
-            (Var ((shaped_array ((dims ()))) (id (Jax.Var 0))))))
+          (inputs ((Lit 2) (Var ((shaped_array ((dims ()))) (id (Jax.Var 0))))))
           (out_binders (((shaped_array ((dims ()))) (id (Jax.Var 2))))))))
        (outs ((Var ((shaped_array ((dims ()))) (id (Jax.Var 2))))))))
-     (values ())) |}];
+     (values ()))
+    |}];
   Jaxpr.to_string jaxpr |> print_endline;
   [%expect
     {|
-      lambda var_0:[] .
-      let var_2:[] = mul (Tensor 2) var_0:[]
-      in var_2:[] |}];
+    lambda var_0:[] .
+    let var_2:[] = mul 2 var_0:[]
+    in var_2:[]
+    |}];
   Jaxpr.typecheck jaxpr |> [%sexp_of: Jaxpr.Type.t] |> print_s;
   [%expect {| ((in_types (((dims ())))) (out_types (((dims ()))))) |}];
   make_jaxpr1
@@ -908,9 +969,181 @@ let%expect_test "make_jaxpr" =
   |> fst
   |> Jaxpr.to_string
   |> print_endline;
-  [%expect
-    {|
+  [%expect {|
     lambda var_3:[] .
-    let var_6:[] = mul (Tensor 2) (Tensor 2)
-    in var_6:[] |}]
+    let var_6:[] = mul 2 2
+    in var_6:[]
+    |}]
+;;
+
+let xla_subcomp jaxpr args ~builder =
+  let { Jaxpr.in_binders; eqns; outs } = jaxpr in
+  let env =
+    Nonempty_list.zip_exn in_binders args
+    |> Nonempty_list.fold ~init:Var.Id.Map.empty ~f:(fun env (var, xla_op) ->
+      Map.add_exn env ~key:(Var.id var) ~data:xla_op)
+  in
+  let read_atom atom ~env =
+    match atom with
+    | Atom.Var var -> Map.find_exn env (Var.id var)
+    | Lit tensor -> Tensor.to_xla_literal tensor |> Xla.Op.constant ~builder
+  in
+  let env =
+    List.fold eqns ~init:env ~f:(fun env { prim; inputs; out_binders } ->
+      let in_vals = Nonempty_list.map inputs ~f:(fun atom -> read_atom atom ~env) in
+      let (out_vals : _ Nonempty_list.t) =
+        match prim, in_vals with
+        | Sin, [ x ] -> [ Xla.Op.sin x ]
+        | Cos, [ x ] -> [ Xla.Op.cos x ]
+        | Neg, [ x ] -> [ Xla.Op.neg x ]
+        | Add, [ x1; x2 ] -> [ Xla.Op.add x1 x2 ]
+        | Sub, [ x1; x2 ] -> [ Xla.Op.sub x1 x2 ]
+        | Mul, [ x1; x2 ] -> [ Xla.Op.mul x1 x2 ]
+        | _ -> raise_s [%message "unexpected xla compilation" (prim : Primitive.t)]
+      in
+      Nonempty_list.zip_exn out_binders out_vals
+      |> Nonempty_list.fold ~init:env ~f:(fun env (var, xla_op) ->
+        Map.add_exn env ~key:(Var.id var) ~data:xla_op))
+  in
+  Nonempty_list.map outs ~f:(fun atom -> read_atom atom ~env)
+;;
+
+let xla_callable jaxpr consts =
+  ignore (Jaxpr.typecheck jaxpr : Jaxpr.Type.t);
+  let in_avals =
+    List.drop (Nonempty_list.to_list jaxpr.in_binders) (List.length consts)
+  in
+  let xla_builder = Xla.Builder.create ~name:"xla_call" in
+  let xla_consts =
+    List.map consts ~f:(fun tensor ->
+      Tensor.to_xla_literal tensor |> Xla.Op.constant ~builder:xla_builder)
+  in
+  let xla_params =
+    List.mapi in_avals ~f:(fun i var ->
+      let var_id = Var.id var in
+      let shaped_array = Var.shaped_array var in
+      Xla.Op.parameter
+        (Var.Id.to_string var_id)
+        ~id:i
+        ~ty:F64
+        ~dims:shaped_array.dims
+        ~builder:xla_builder)
+  in
+  let out =
+    xla_subcomp
+      jaxpr
+      (Nonempty_list.of_list_exn (xla_consts @ xla_params))
+      ~builder:xla_builder
+    |> Nonempty_list.to_list
+    |> Xla.Op.tuple ~builder:xla_builder
+  in
+  let xla_client = Xla.Client.cpu () in
+  let xla_device = Xla.Client.addressable_devices xla_client |> List.hd_exn in
+  let xla_exe = Xla.Computation.build ~root:out |> Xla.Executable.compile xla_client in
+  Staged.stage (fun inputs ->
+    let inputs =
+      Nonempty_list.map inputs ~f:(fun tensor ->
+        Tensor.to_xla_literal tensor |> Xla.Buffer.of_host_literal ~device:xla_device)
+      |> Nonempty_list.to_array
+    in
+    let buffers = Xla.Executable.execute_b xla_exe inputs in
+    let buffer = buffers.(0).(0) in
+    Xla.Buffer.to_literal_sync buffer
+    |> Xla.Literal.decompose_tuple
+    |> Array.to_list
+    |> Nonempty_list.of_list_exn
+    |> Nonempty_list.map ~f:Tensor.of_xla_literal)
+;;
+
+let xla_callable =
+  Memo.of_comparable
+    (module struct
+      module T = struct
+        type t = Jaxpr.t * Tensor.t list [@@deriving compare, sexp_of]
+      end
+
+      include T
+      include Comparable.Make_plain (T)
+    end)
+    (fun (jaxpr, consts) -> xla_callable jaxpr consts)
+  |> Tuple2.curry
+;;
+
+(* TODO: Oof, such an ugly hack! *)
+let () = Set_once.set_exn xla_callable' [%here] xla_callable
+
+let jit ~f =
+  Staged.stage (fun args ->
+    let avals_in =
+      Nonempty_list.map args ~f:(fun value ->
+        Value.get_aval value |> Abstract_value.shaped_array)
+    in
+    let jaxpr, consts = make_jaxpr ~f avals_in in
+    bind (Xla_call { jaxpr; num_consts = List.length consts }) args)
+;;
+
+let jit1 ~f =
+  let f =
+    jit ~f:(function
+      | Nonempty_list.[ x ] -> [ f x ]
+      | _ -> assert false)
+    |> Staged.unstage
+  in
+  Staged.stage (fun x ->
+    match f [ x ] with
+    | [ z ] -> z
+    | _ -> assert false)
+;;
+
+let jit2 ~f =
+  let f =
+    jit ~f:(function
+      | Nonempty_list.[ x; y ] -> [ f x y ]
+      | _ -> assert false)
+    |> Staged.unstage
+  in
+  Staged.stage (fun x y ->
+    match f [ x; y ] with
+    | [ z ] -> z
+    | _ -> assert false)
+;;
+
+let%expect_test "jit" =
+  Core_unix.putenv ~key:"TF_CPP_MIN_LOG_LEVEL" ~data:"2";
+  let f x y =
+    print_endline "tracing!";
+    sin x * cos y
+  in
+  let f_jitted = jit2 ~f |> Staged.unstage in
+  f_jitted (Value.of_float 3.) (Value.of_float 4.)
+  |> [%sexp_of: Value.Hide_id.t]
+  |> print_s;
+  [%expect {|
+    tracing!
+    (Tensor -0.092242193044553708)
+    |}];
+  (* TODO: cache isn't hitting, probably because of the various [Id.t]s
+     sprinkled in various places :( *)
+  let f_jitted = jit2 ~f |> Staged.unstage in
+  f_jitted (Value.of_float 4.) (Value.of_float 5.)
+  |> [%sexp_of: Value.Hide_id.t]
+  |> print_s;
+  [%expect {|
+    tracing!
+    (Tensor -0.21467624978306998)
+    |}];
+  let f x =
+    let y = sin x * Value.of_float 2. in
+    let z = -y + x in
+    z
+  in
+  let deriv ~f x = jvp1 ~f x (Value.of_float 1.) |> snd in
+  deriv ~f:(deriv ~f) (Value.of_float 3.) |> [%sexp_of: Value.Hide_id.t] |> print_s;
+  Staged.unstage (jit1 ~f:(deriv ~f:(deriv ~f))) (Value.of_float 3.)
+  |> [%sexp_of: Value.Hide_id.t]
+  |> print_s;
+  [%expect {|
+    (Tensor 0.28224001611973443)
+    (Tensor 0.28224001611973443)
+    |}]
 ;;
