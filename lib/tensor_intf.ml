@@ -24,6 +24,7 @@ module type Tensor = sig
   val zeros : dims:int array -> t
   val ones : dims:int array -> t
   val arange : int -> t
+  val of_xla_literal : Xla.Literal.t -> t
   val map : t -> f:(float -> float) -> t
   val map2 : t -> t -> f:(float -> float -> float) -> t
 

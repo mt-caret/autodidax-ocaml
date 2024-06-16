@@ -73,6 +73,25 @@ let%expect_test "arange" =
   [%expect {| ((0 1 2 3) (4 5 6 7) (8 9 10 11)) |}]
 ;;
 
+let of_xla_literal literal = Xla.Literal.to_bigarray literal ~kind:Bigarray.float64
+
+let%expect_test "xla" =
+  Core_unix.putenv ~key:"TF_CPP_MIN_LOG_LEVEL" ~data:"2";
+  let cpu = Xla.Client.cpu () in
+  let builder = Xla.Builder.create ~name:"test_builder" in
+  let root =
+    let f = Xla.Op.r0_f64 ~builder in
+    Xla.Op.add (f 39.) (f 3.)
+  in
+  let computation = Xla.Computation.build ~root in
+  let exe = Xla.Executable.compile cpu computation in
+  let buffers = Xla.Executable.execute exe [||] in
+  let literal = Xla.Buffer.to_literal_sync buffers.(0).(0) in
+  let t = of_xla_literal literal in
+  print_s [%message "" (t : t)];
+  [%expect {| (t 42) |}]
+;;
+
 let map t ~f =
   match num_dims t with
   | 0 -> get t [||] |> f |> of_float
