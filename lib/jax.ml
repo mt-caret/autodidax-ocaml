@@ -30,7 +30,7 @@ module Abstract_value = struct
 end
 
 module type Tracer = sig
-  type t
+  type t [@@deriving sexp_of]
   type value
 
   val aval : t -> Abstract_value.t
@@ -163,6 +163,8 @@ end
 module type Interpreter0 = sig
   type packed_tracer
 
+  val name : string
+
   module Tracer : Tracer
   module Level : Interpreter_level
 
@@ -213,7 +215,10 @@ end = struct
         ; interpreter : (('tracer, 'global_data) Interpreter.t[@sexp.opaque])
         }
         -> t
-  [@@deriving sexp_of]
+
+  let sexp_of_t (T { tracer; interpreter = (module Interpreter) }) =
+    [%sexp_of: string * Interpreter.Tracer.t] (Interpreter.name, tracer)
+  ;;
 end
 
 and Value : sig
@@ -351,12 +356,22 @@ let new_dynamic_interpreter interpreter ~f =
     ~finally:(fun () -> dynamic_interpreter := old_dynamic_interpreter)
 ;;
 
+let debug = ref false
+let jaxpr_to_string = Set_once.create ()
+
 let bind prim values =
   let (T interpreter) = find_top_interpreter values in
   let tracers =
     Nonempty_list.map values ~f:(fun value -> Value.full_raise interpreter value)
   in
   let (module Interpreter) = interpreter in
+  if !debug
+  then (
+    print_s [%message "bind" (prim : Primitive.t) (values : Value.t Nonempty_list.t)];
+    match prim with
+    | Xla_call { jaxpr; num_consts = _ } ->
+      Set_once.get_exn jaxpr_to_string [%here] jaxpr |> print_endline
+    | _ -> ());
   Interpreter.process_primitive prim tracers
   |> Nonempty_list.map ~f:Interpreter.Tracer.full_lower
 ;;
@@ -379,8 +394,10 @@ let eval_interpreter ~level : (Tensor.t, unit) Interpreter.t =
   (module struct
     type packed_tracer = Packed_tracer.t
 
+    let name = "eval_interpreter"
+
     module Tracer = struct
-      type t = Tensor.t
+      type t = Tensor.t [@@deriving sexp_of]
       type value = Value.t
 
       let aval t = Abstract_value.Concrete_array t
@@ -446,14 +463,18 @@ module Jvp_tracer = struct
   [@@deriving sexp_of]
 end
 
+let jvp_jaxpr' = Set_once.create ()
+
 let jvp_interpreter ~level () : (Jvp_tracer.t, unit) Interpreter.t =
   let rec interpreter : (Jvp_tracer.t, unit) Interpreter.t lazy_t =
     lazy
       (module struct
         type packed_tracer = Packed_tracer.t
 
+        let name = "jvp_interpreter"
+
         module Tracer = struct
-          type t = Jvp_tracer.t
+          type t = Jvp_tracer.t [@@deriving sexp_of]
           type value = Value.t
 
           let aval { Jvp_tracer.primal; tangent = _ } = Value.get_aval primal
@@ -502,6 +523,21 @@ let jvp_interpreter ~level () : (Jvp_tracer.t, unit) Interpreter.t =
             [ { primal = x1 - x2; tangent = dx1 - dx2 } ]
           | Mul, [ { primal = x1; tangent = dx1 }; { primal = x2; tangent = dx2 } ] ->
             [ { primal = x1 * x2; tangent = (x1 * dx2) + (dx1 * x2) } ]
+          | Xla_call { jaxpr; num_consts = _ }, args ->
+            let new_jaxpr, new_consts = (Set_once.get_exn jvp_jaxpr' [%here]) jaxpr in
+            let primals, tangents =
+              Nonempty_list.map args ~f:(fun { primal; tangent } -> primal, tangent)
+              |> Nonempty_list.unzip
+            in
+            let outs =
+              bind
+                (Xla_call { jaxpr = new_jaxpr; num_consts = List.length new_consts })
+                (Nonempty_list.append primals (Nonempty_list.to_list tangents))
+            in
+            List.split_n (Nonempty_list.to_list outs) (Nonempty_list.length outs / 2)
+            |> Tuple2.uncurry List.zip_exn
+            |> List.map ~f:(fun (primal, tangent) -> { Jvp_tracer.primal; tangent })
+            |> Nonempty_list.of_list_exn
           | _ ->
             raise_s
               [%message
@@ -522,18 +558,20 @@ let jvp ~f primals tangets =
         |> Nonempty_list.map ~f:(fun (primal, tangent) ->
           Value.of_tracer (T { tracer = { Jvp_tracer.primal; tangent }; interpreter }))
       in
-      let out = f tracers_in in
-      let { Jvp_tracer.primal; tangent } = Value.full_raise interpreter out in
-      primal, tangent)
+      f tracers_in |> Nonempty_list.map ~f:(Value.full_raise interpreter))
 ;;
 
 let jvp1 ~f primal tangent =
-  jvp
-    ~f:(function
-      | Nonempty_list.[ x ] -> f x
-      | _ -> assert false)
-    [ primal ]
-    [ tangent ]
+  match
+    jvp
+      ~f:(function
+        | Nonempty_list.[ x ] -> [ f x ]
+        | _ -> assert false)
+      [ primal ]
+      [ tangent ]
+  with
+  | [ { primal; tangent } ] -> primal, tangent
+  | _ -> assert false
 ;;
 
 let%expect_test "jvp" =
@@ -832,6 +870,8 @@ module Jaxpr = struct
     in
     [%string "lambda %{in_binders} .\nlet %{eqns}\nin %{outs}"]
   ;;
+
+  let () = Set_once.set_exn jaxpr_to_string [%here] to_string
 end
 
 let jaxpr_interpreter ~level (builder : Jaxpr.Builder.t)
@@ -842,8 +882,10 @@ let jaxpr_interpreter ~level (builder : Jaxpr.Builder.t)
       (module struct
         type packed_tracer = Packed_tracer.t
 
+        let name = "jaxpr_interpreter"
+
         module Tracer = struct
-          type t = Jaxpr.Tracer.t
+          type t = Jaxpr.Tracer.t [@@deriving sexp_of]
           type value = Value.t
 
           let aval (t : Jaxpr.Tracer.t) = Abstract_value.Shaped_array t.shaped_array
@@ -1146,4 +1188,43 @@ let%expect_test "jit" =
     (Tensor 0.28224001611973443)
     (Tensor 0.28224001611973443)
     |}]
+;;
+
+let jvp_jaxpr (jaxpr : Jaxpr.t) =
+  let backtrace = Backtrace.get () in
+  let in_avals = Nonempty_list.map jaxpr.in_binders ~f:Var.shaped_array in
+  make_jaxpr
+    (Nonempty_list.append in_avals (Nonempty_list.to_list in_avals))
+    ~f:(fun primals_and_tangents ->
+      if !debug
+      then
+        print_s
+          [%message
+            "" (primals_and_tangents : Value.t Nonempty_list.t) (backtrace : Backtrace.t)];
+      let primals, tangents =
+        List.split_n
+          (Nonempty_list.to_list primals_and_tangents)
+          (Nonempty_list.length primals_and_tangents / 2)
+        |> Tuple2.map ~f:Nonempty_list.of_list_exn
+      in
+      let primals, tangents =
+        jvp primals tangents ~f:(fun primals -> Jaxpr.eval jaxpr primals)
+        |> Nonempty_list.map ~f:(fun { primal; tangent } -> primal, tangent)
+        |> Nonempty_list.unzip
+      in
+      Nonempty_list.append primals (Nonempty_list.to_list tangents))
+;;
+
+let () = Set_once.set_exn jvp_jaxpr' [%here] jvp_jaxpr
+
+let%expect_test "jvp+jit" =
+  let f x =
+    let y = sin x * Value.of_float 2. in
+    let z = -y + x in
+    z
+  in
+  let x, dx = Value.of_float 3., Value.of_float 1. in
+  let y, dy = jvp1 ~f:(Staged.unstage (jit1 ~f)) x dx in
+  [%sexp_of: Value.Hide_id.t * Value.Hide_id.t] (y, dy) |> print_s;
+  [%expect {| ((Tensor 2.7177599838802657) (Tensor 2.9799849932008908)) |}]
 ;;
