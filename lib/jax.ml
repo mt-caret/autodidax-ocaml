@@ -137,6 +137,14 @@ and Jaxpr0 : sig
     [@@deriving sexp_of, compare]
   end
 
+  module Type : sig
+    type t =
+      { in_types : Shaped_array.t Nonempty_list.t
+      ; out_types : Shaped_array.t Nonempty_list.t
+      }
+    [@@deriving sexp_of]
+  end
+
   type t =
     { in_binders : Var.t Nonempty_list.t
     ; eqns : Eqn.t list
@@ -151,6 +159,14 @@ end = struct
       ; out_binders : Var.t Nonempty_list.t
       }
     [@@deriving sexp_of, compare]
+  end
+
+  module Type = struct
+    type t =
+      { in_types : Shaped_array.t Nonempty_list.t
+      ; out_types : Shaped_array.t Nonempty_list.t
+      }
+    [@@deriving sexp_of]
   end
 
   type t =
@@ -604,6 +620,8 @@ let%expect_test "jvp" =
   [%expect {| (Tensor 0.14112000805986721) |}]
 ;;
 
+let jaxpr_typecheck = Set_once.create ()
+
 let abstract_eval (prim : Primitive.t) (inputs : Shaped_array.t Nonempty_list.t) =
   let unary_op { Shaped_array.dims } = { Shaped_array.dims } in
   let binary_op { Shaped_array.dims = dims1 } { Shaped_array.dims = dims2 } =
@@ -618,6 +636,12 @@ let abstract_eval (prim : Primitive.t) (inputs : Shaped_array.t Nonempty_list.t)
   | Add, [ x1; x2 ] -> [ binary_op x1 x2 ]
   | Sub, [ x1; x2 ] -> [ binary_op x1 x2 ]
   | Mul, [ x1; x2 ] -> [ binary_op x1 x2 ]
+  | Xla_call { jaxpr; num_consts = _ }, args ->
+    let jaxpr_type = Set_once.get_exn jaxpr_typecheck [%here] jaxpr in
+    [%test_result: Shaped_array.t Nonempty_list.t]
+      args
+      ~expect:jaxpr_type.Jaxpr0.Type.in_types;
+    jaxpr_type.out_types
   | _ -> raise_s [%message "Unexpected primitive" (prim : Primitive.t)]
 ;;
 
@@ -639,7 +663,7 @@ module Jaxpr = struct
   end
 
   module Type = struct
-    type t =
+    type t = Jaxpr0.Type.t =
       { in_types : Shaped_array.t Nonempty_list.t
       ; out_types : Shaped_array.t Nonempty_list.t
       }
@@ -707,6 +731,8 @@ module Jaxpr = struct
       }
   ;;
 
+  let () = Set_once.set_exn jaxpr_typecheck [%here] typecheck
+
   let eval t args =
     let { in_binders; eqns; outs } = t in
     let env =
@@ -747,7 +773,7 @@ module Jaxpr = struct
 
   module Builder = struct
     type t =
-      { mutable eqns : Eqn.t list (* TODO: fix int? *)
+      { mutable eqns : Eqn.t list
       ; mutable tracer_to_var : Var.t Tracer.Id.Map.t
       ; mutable const_tracers : Tracer.t Value.Id.Map.t
       ; mutable const_vals : Value.t Var.Id.Map.t
@@ -1332,6 +1358,20 @@ end = struct
   ;;
 end
 
+let partial_eval_jaxpr' = Set_once.create ()
+
+let merge_lists_tf =
+  let rec go accum which xs ys ~sexp_of_t =
+    match which, xs, ys with
+    | [], [], [] -> List.rev accum
+    | true :: which, x :: xs, _ -> go (x :: accum) which xs ys ~sexp_of_t
+    | false :: which, _, y :: ys -> go (y :: accum) which xs ys ~sexp_of_t
+    | _, _, _ ->
+      raise_s [%message "unexpected extra elements" (xs : t list) (ys : t list)]
+  in
+  fun which xs ys ~sexp_of_t -> go [] which xs ys ~sexp_of_t
+;;
+
 let partial_eval_interpreter ~level () : (Partial_eval_tracer.t, unit) Interpreter.t =
   let rec interpreter : (Partial_eval_tracer.t, unit) Interpreter.t lazy_t =
     lazy
@@ -1403,7 +1443,62 @@ let partial_eval_interpreter ~level () : (Partial_eval_tracer.t, unit) Interpret
             |> Nonempty_list.map ~f:tracer_of_value
           else (
             match prim with
-            (* TODO: fillme with partial_eval_rules? *)
+            | Xla_call { jaxpr; num_consts = _ } ->
+              let in_unknowns =
+                Nonempty_list.map tracers ~f:(fun { partial_value; recipe = _; id = _ } ->
+                  match partial_value with
+                  | Known _ -> false
+                  | Unknown _ -> true)
+              in
+              let jaxpr1, jaxpr2, out_unknowns, num_res =
+                Set_once.get_exn partial_eval_jaxpr' [%here] jaxpr ~in_unknowns
+              in
+              let known_values, unknown_tracers =
+                Nonempty_list.to_list tracers
+                |> List.partition_map
+                     ~f:(fun ({ partial_value; recipe = _; id = _ } as tracer) ->
+                       match partial_value with
+                       | Known { const; shaped_array = _ } -> Either.First const
+                       | Unknown _ -> Second tracer)
+              in
+              let outs1_res =
+                bind
+                  (Xla_call { jaxpr = jaxpr1; num_consts = 0 })
+                  (Nonempty_list.of_list_exn known_values)
+              in
+              let outs1, res =
+                List.split_n
+                  (Nonempty_list.to_list outs1_res)
+                  (Int.( - ) (Nonempty_list.length outs1_res) num_res)
+              in
+              let res_tracers =
+                List.map res ~f:(fun value ->
+                  Value.full_raise (force interpreter) value |> instantiate_const)
+              in
+              let rec outs2 =
+                lazy
+                  (Nonempty_list.map jaxpr2.Jaxpr.outs ~f:(fun atom ->
+                     Partial_eval_tracer.create
+                       ~partial_value:
+                         (Partial_value.Unknown { shaped_array = Atom.shaped_array atom })
+                       ~recipe:(Some (force eqn))))
+              and eqn =
+                lazy
+                  (Jaxpr_recipe.create
+                     (Jaxpr_recipe_variant.Jaxpr_eqn
+                        { prim = Xla_call { jaxpr = jaxpr2; num_consts = 0 }
+                        ; tracers_in =
+                            Nonempty_list.of_list_exn (res_tracers @ unknown_tracers)
+                        ; avals_out = Nonempty_list.map jaxpr2.outs ~f:Atom.shaped_array
+                        ; tracer_refs_out = outs2
+                        }))
+              in
+              merge_lists_tf
+                (Nonempty_list.to_list out_unknowns)
+                (force outs2 |> Nonempty_list.to_list)
+                (List.map outs1 ~f:tracer_of_value)
+                ~sexp_of_t:[%sexp_of: Partial_eval_tracer.t]
+              |> Nonempty_list.of_list_exn
             | _ ->
               let tracers_in = Nonempty_list.map tracers ~f:instantiate_const in
               let avals_in =
@@ -1559,7 +1654,7 @@ let tracers_to_jaxpr
       Map.find_exn tracer_to_var tracer.id |> Atom.Var)
     |> Nonempty_list.of_list_exn
   in
-  let jaxpr = { Jaxpr.in_binders; eqns; outs = out_vars } in
+  let jaxpr = { Jaxpr.in_binders; eqns = List.rev eqns; outs = out_vars } in
   ignore (Jaxpr.typecheck jaxpr : Jaxpr.Type.t);
   jaxpr, constvals
 ;;
@@ -1664,4 +1759,212 @@ let%expect_test "linearize" =
     (sin_lin (Value.of_float 1.), cos (Value.of_float 3.))
   |> print_s;
   [%expect {| ((Tensor -0.98999249660044542) (Tensor -0.98999249660044542)) |}]
+;;
+
+let typecheck_partial_eval_jaxpr jaxpr ~unks_in ~unks_out ~jaxpr1 ~jaxpr2 =
+  let jaxpr_type =
+    (* (a1, a2) -> (b1, b2) *)
+    Jaxpr.typecheck jaxpr
+  in
+  let jaxpr1_type =
+    (* a1 -> (b1, res) *)
+    Jaxpr.typecheck jaxpr1
+  in
+  let jaxpr2_type =
+    (* (res, a2) -> b2 *)
+    Jaxpr.typecheck jaxpr2
+  in
+  let a1, a2 =
+    Nonempty_list.zip_exn jaxpr_type.in_types unks_in
+    |> Nonempty_list.to_list
+    |> List.partition_map ~f:(fun (type_, is_unknown) ->
+      match is_unknown with
+      | true -> Either.Second type_
+      | false -> First type_)
+  in
+  let b1, b2 =
+    Nonempty_list.zip_exn jaxpr_type.out_types unks_out
+    |> Nonempty_list.to_list
+    |> List.partition_map ~f:(fun (type_, is_unknown) ->
+      match is_unknown with
+      | true -> Either.Second type_
+      | false -> First type_)
+  in
+  let b1_, res =
+    List.split_n (Nonempty_list.to_list jaxpr1_type.out_types) (List.length b1)
+  in
+  let res_, a2_ =
+    List.split_n (Nonempty_list.to_list jaxpr2_type.in_types) (List.length res)
+  in
+  let b2_ = Nonempty_list.to_list jaxpr2_type.out_types in
+  [%test_result: Shaped_array.t list]
+    (Nonempty_list.to_list jaxpr1_type.in_types)
+    ~expect:a1;
+  [%test_result: Shaped_array.t list] b1_ ~expect:b1;
+  [%test_result: Shaped_array.t list] res_ ~expect:res;
+  [%test_result: Shaped_array.t list] a2_ ~expect:a2;
+  [%test_result: Shaped_array.t list] b2_ ~expect:b2
+;;
+
+let rec partial_eval_jaxpr jaxpr ~in_unknowns =
+  let { Jaxpr.in_binders; eqns; outs } = jaxpr in
+  let env =
+    Nonempty_list.map2_exn in_binders in_unknowns ~f:(fun var unknown ->
+      Var.id var, unknown)
+    |> Nonempty_list.to_list
+    |> Var.Id.Map.of_alist_exn
+  in
+  let module Accum = struct
+    type t =
+      { env : bool Var.Id.Map.t
+      ; residuals : Var.Id.Set.t
+      ; eqns1 : Jaxpr.Eqn.t list
+      ; eqns2 : Jaxpr.Eqn.t list
+      }
+  end
+  in
+  let is_unknown ~env = function
+    | Atom.Var var -> Map.find_exn env (Var.id var)
+    | Lit _ -> false
+  in
+  let { Accum.env; residuals; eqns1; eqns2 } =
+    List.fold
+      eqns
+      ~init:{ Accum.env; residuals = Var.Id.Set.empty; eqns1 = []; eqns2 = [] }
+      ~f:
+        (fun
+          ({ env; residuals; eqns1; eqns2 } as accum)
+          ({ prim; inputs; out_binders } as eqn)
+        ->
+        let unks_in = Nonempty_list.map inputs ~f:(is_unknown ~env) in
+        match prim with
+        | Xla_call { jaxpr; num_consts } ->
+          assert (num_consts = 0);
+          let eqn1, eqn2, unks_out, res =
+            (* xla_call_peval_eqn *)
+            let jaxpr1, jaxpr2, unks_out, num_res =
+              partial_eval_jaxpr jaxpr ~in_unknowns:unks_in
+            in
+            let ins1, ins2 =
+              Nonempty_list.zip_exn inputs unks_in
+              |> Nonempty_list.to_list
+              |> List.partition_map ~f:(fun (v, unk) ->
+                match unk with
+                | true -> Either.Second v
+                | false -> First v)
+              |> Tuple2.map ~f:Nonempty_list.of_list_exn
+            in
+            let out_binders1, out_binders2 =
+              Nonempty_list.zip_exn out_binders unks_out
+              |> Nonempty_list.to_list
+              |> List.partition_map ~f:(fun (v, unk) ->
+                match unk with
+                | true -> Either.Second v
+                | false -> First v)
+              |> Tuple2.map ~f:Nonempty_list.of_list_exn
+            in
+            let residuals =
+              List.take (Nonempty_list.to_list jaxpr2.Jaxpr.in_binders) num_res
+            in
+            let eqn1 =
+              { Jaxpr.Eqn.prim = Xla_call { jaxpr = jaxpr1; num_consts = 0 }
+              ; inputs = ins1
+              ; out_binders = Nonempty_list.append out_binders1 residuals
+              }
+            in
+            let eqn2 =
+              { Jaxpr.Eqn.prim = Xla_call { jaxpr = jaxpr2; num_consts = 0 }
+              ; inputs = List.map residuals ~f:(fun var -> Atom.Var var) @* ins2
+              ; out_binders = out_binders2
+              }
+            in
+            eqn1, eqn2, unks_out, List.map residuals ~f:Var.id |> Var.Id.Set.of_list
+          in
+          let eqns1 = eqn1 :: eqns1 in
+          let eqns2 = eqn2 :: eqns2 in
+          let residuals = Set.union residuals res in
+          let env =
+            Nonempty_list.zip_exn out_binders unks_out
+            |> Nonempty_list.fold ~init:env ~f:(fun env (var, unk) ->
+              Map.add_exn env ~key:(Var.id var) ~data:unk)
+          in
+          { eqns1; eqns2; residuals; env }
+        | _ ->
+          (match Nonempty_list.exists unks_in ~f:Fn.id with
+           | true ->
+             let residuals =
+               Nonempty_list.zip_exn unks_in inputs
+               |> Nonempty_list.fold ~init:residuals ~f:(fun residuals (unk, v) ->
+                 match v with
+                 | Atom.Var var when not unk -> Set.add residuals (Var.id var)
+                 | Var _ | Lit _ -> residuals)
+             in
+             let eqns2 = { Jaxpr.Eqn.prim; inputs; out_binders } :: eqns2 in
+             let env =
+               Nonempty_list.fold out_binders ~init:env ~f:(fun env var ->
+                 Map.add_exn env ~key:(Var.id var) ~data:true)
+             in
+             { accum with env; residuals; eqns2 }
+           | false ->
+             let eqns1 = eqn :: eqns1 in
+             let env =
+               Nonempty_list.fold out_binders ~init:env ~f:(fun env var ->
+                 Map.add_exn env ~key:(Var.id var) ~data:false)
+             in
+             { accum with env; eqns1 }))
+  in
+  let out_unknowns = Nonempty_list.map outs ~f:(is_unknown ~env) in
+  let ins1, ins2 =
+    Nonempty_list.zip_exn in_binders in_unknowns
+    |> Nonempty_list.to_list
+    |> List.partition_map ~f:(fun (var, is_unknown) ->
+      match is_unknown with
+      | true -> Either.Second var
+      | false -> First var)
+    |> Tuple2.map ~f:Nonempty_list.of_list_exn
+  in
+  let outs1, outs2 =
+    Nonempty_list.zip_exn outs out_unknowns
+    |> Nonempty_list.to_list
+    |> List.partition_map ~f:(fun (var, is_unknown) ->
+      match is_unknown with
+      | true -> Either.Second var
+      | false -> First var)
+  in
+  let residuals = Set.to_list residuals |> List.map ~f:Var.lookup in
+  let jaxpr1 =
+    { Jaxpr.in_binders = ins1
+    ; eqns = List.rev eqns1
+    ; outs =
+        Nonempty_list.of_list_exn (outs1 @ List.map residuals ~f:(fun var -> Atom.Var var))
+    }
+  in
+  let jaxpr2 =
+    { Jaxpr.in_binders = residuals @* ins2
+    ; eqns = List.rev eqns2
+    ; outs = Nonempty_list.of_list_exn outs2
+    }
+  in
+  typecheck_partial_eval_jaxpr
+    jaxpr
+    ~unks_in:in_unknowns
+    ~unks_out:out_unknowns
+    ~jaxpr1
+    ~jaxpr2;
+  jaxpr1, jaxpr2, out_unknowns, List.length residuals
+;;
+
+let () = Set_once.set_exn partial_eval_jaxpr' [%here] partial_eval_jaxpr
+
+let%expect_test "jit+linearize" =
+  let f x =
+    let y = sin x * Value.of_float 2. in
+    let z = -y + x in
+    z
+  in
+  let f_jitted = jit1 ~f |> Staged.unstage in
+  let y, f_lin = linearize1 ~f:f_jitted (Value.of_float 3.) in
+  let y_dot = f_lin (Value.of_float 1.) in
+  [%sexp_of: Value.Hide_id.t * Value.Hide_id.t] (y, y_dot) |> print_s;
+  [%expect {| ((Tensor 2.7177599838802657) (Tensor 2.9799849932008908)) |}]
 ;;
