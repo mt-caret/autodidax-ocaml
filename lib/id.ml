@@ -5,7 +5,7 @@ module Make (S : sig
   end) =
 struct
   module T = struct
-    type t = int [@@deriving compare]
+    type t = int [@@deriving compare, hash]
 
     let t_of_sexp sexp = snd ([%of_sexp: string * int] sexp)
     let sexp_of_t t = [%sexp_of: string * int] (S.name, t)
@@ -14,6 +14,7 @@ struct
 
   include T
   include Comparable.Make (T)
+  include Hashable.Make (T)
 
   let create =
     let counter = ref 0 in

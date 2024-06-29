@@ -17,6 +17,7 @@ module Abstract_value = struct
   type t =
     | Shaped_array of Shaped_array.t
     | Concrete_array of Tensor.t
+  [@@deriving sexp_of]
 
   let shaped_array = function
     | Shaped_array shaped_array -> shaped_array
@@ -620,6 +621,13 @@ let abstract_eval (prim : Primitive.t) (inputs : Shaped_array.t Nonempty_list.t)
   | _ -> raise_s [%message "Unexpected primitive" (prim : Primitive.t)]
 ;;
 
+(* 'a list -> 'a Nonempty_list.t -> 'a Nonempty_list.t *)
+let ( @* ) list nonempty_list =
+  match list with
+  | [] -> nonempty_list
+  | x :: xs -> Nonempty_list.(x :: List.append xs (to_list nonempty_list))
+;;
+
 module Jaxpr = struct
   module Eqn = struct
     type t = Jaxpr0.Eqn.t =
@@ -778,13 +786,6 @@ module Jaxpr = struct
       var
     ;;
 
-    (* 'a list -> 'a Nonempty_list.t -> 'a Nonempty_list.t *)
-    let ( @* ) list nonempty_list =
-      match list with
-      | [] -> nonempty_list
-      | x :: xs -> Nonempty_list.(x :: List.append xs (to_list nonempty_list))
-    ;;
-
     let build t in_tracers out_tracers =
       let { eqns; tracer_to_var; const_tracers = _; const_vals; tracers = _ } = t in
       let const_vars = Map.keys const_vals in
@@ -888,7 +889,7 @@ let jaxpr_interpreter ~level (builder : Jaxpr.Builder.t)
           type t = Jaxpr.Tracer.t [@@deriving sexp_of]
           type value = Value.t
 
-          let aval (t : Jaxpr.Tracer.t) = Abstract_value.Shaped_array t.shaped_array
+          let aval (t : t) = Abstract_value.Shaped_array t.shaped_array
 
           let full_lower t =
             Value.of_tracer (T { tracer = t; interpreter = force interpreter })
@@ -1227,4 +1228,440 @@ let%expect_test "jvp+jit" =
   let y, dy = jvp1 ~f:(Staged.unstage (jit1 ~f)) x dx in
   [%sexp_of: Value.Hide_id.t * Value.Hide_id.t] (y, dy) |> print_s;
   [%expect {| ((Tensor 2.7177599838802657) (Tensor 2.9799849932008908)) |}]
+;;
+
+module Partial_value = struct
+  type t =
+    | Known of
+        { shaped_array : Shaped_array.t
+        ; const : Value.t
+        }
+    | Unknown of { shaped_array : Shaped_array.t }
+  [@@deriving sexp_of]
+end
+
+module rec Jaxpr_recipe_variant : sig
+  type t =
+    | Lambda_binding
+    | Const_recipe of Value.t
+    | Jaxpr_eqn of
+        { prim : Primitive.t
+        ; tracers_in : Partial_eval_tracer.t Nonempty_list.t
+        ; avals_out : Shaped_array.t Nonempty_list.t
+        ; tracer_refs_out : Partial_eval_tracer.t Nonempty_list.t lazy_t
+        }
+  [@@deriving sexp_of]
+end = struct
+  type t =
+    | Lambda_binding
+    | Const_recipe of Value.t
+    | Jaxpr_eqn of
+        { prim : Primitive.t
+        ; tracers_in : Partial_eval_tracer.t Nonempty_list.t
+        ; avals_out : Shaped_array.t Nonempty_list.t
+        ; tracer_refs_out : Partial_eval_tracer.t Nonempty_list.t lazy_t
+        }
+  [@@deriving sexp_of]
+end
+
+and Jaxpr_recipe : sig
+  module Id : Comparable.S
+
+  type t =
+    { id : Id.t
+    ; variant : Jaxpr_recipe_variant.t
+    }
+  [@@deriving sexp_of]
+
+  val create : Jaxpr_recipe_variant.t -> t
+  val variant : t -> Jaxpr_recipe_variant.t
+end = struct
+  module Id = Id.Make (struct
+      let name = "Jax.Jaxpr_recipe"
+    end)
+
+  type t =
+    { id : Id.t
+    ; variant : Jaxpr_recipe_variant.t
+    }
+  [@@deriving sexp_of, fields]
+
+  let create variant = { id = Id.create (); variant }
+end
+
+and Partial_eval_tracer : sig
+  module Id : Comparable.S
+
+  type t =
+    { partial_value : Partial_value.t
+    ; recipe : Jaxpr_recipe.t option
+    ; id : Id.t
+    }
+  [@@deriving sexp_of, compare, equal, hash]
+
+  val shaped_array : t -> Shaped_array.t
+  val create : partial_value:Partial_value.t -> recipe:Jaxpr_recipe.t option -> t
+  val new_arg : Partial_value.t -> t
+end = struct
+  module Id = Id.Make (struct
+      let name = "Jax.Partial_eval_tracer"
+    end)
+
+  type t =
+    { partial_value : Partial_value.t
+    ; recipe : Jaxpr_recipe.t option
+    ; id : Id.t
+    }
+  [@@deriving sexp_of, fields]
+
+  let compare = Comparable.lift [%compare: Id.t] ~f:id
+  let equal = [%compare.equal: t]
+  let hash t = Id.hash t.id
+  let hash_fold_t state t = Id.hash_fold_t state t.id
+
+  let shaped_array t =
+    match t.partial_value with
+    | Known { shaped_array; const = _ } -> shaped_array
+    | Unknown { shaped_array } -> shaped_array
+  ;;
+
+  let create ~partial_value ~recipe = { partial_value; recipe; id = Id.create () }
+
+  let new_arg partial_value =
+    create ~partial_value ~recipe:(Some (Jaxpr_recipe.create Lambda_binding))
+  ;;
+end
+
+let partial_eval_interpreter ~level () : (Partial_eval_tracer.t, unit) Interpreter.t =
+  let rec interpreter : (Partial_eval_tracer.t, unit) Interpreter.t lazy_t =
+    lazy
+      (module struct
+        type packed_tracer = Packed_tracer.t
+
+        let name = "partial_eval_interpreter"
+
+        module Tracer = struct
+          type t = Partial_eval_tracer.t [@@deriving sexp_of]
+          type value = Value.t
+
+          let aval t = Abstract_value.Shaped_array (Partial_eval_tracer.shaped_array t)
+
+          let full_lower (t : t) =
+            match t.partial_value with
+            | Known { shaped_array = _; const } -> Value.full_lower const
+            | Unknown { shaped_array = _ } ->
+              Value.of_tracer (T { tracer = t; interpreter = force interpreter })
+          ;;
+        end
+
+        module Level = struct
+          type global_data = unit
+
+          let level = level
+          let global_data = ()
+        end
+
+        let tracer_witness =
+          Type_equal.Id.create
+            ~name:"partial_eval_tracer"
+            [%sexp_of: Partial_eval_tracer.t]
+        ;;
+
+        let tracer_of_value value =
+          Partial_eval_tracer.create
+            ~partial_value:
+              (Known
+                 { shaped_array = Value.get_aval value |> Abstract_value.shaped_array
+                 ; const = value
+                 })
+            ~recipe:None
+        ;;
+
+        let pure tensor = tracer_of_value (Value.of_tensor tensor)
+        let lift packed_tracer = tracer_of_value (Value.of_tracer packed_tracer)
+
+        let instantiate_const (tracer : Partial_eval_tracer.t) =
+          match tracer.partial_value with
+          | Unknown { shaped_array = _ } -> tracer
+          | Known { shaped_array; const } ->
+            Partial_eval_tracer.create
+              ~partial_value:(Unknown { shaped_array })
+              ~recipe:(Some (Jaxpr_recipe.create (Const_recipe const)))
+        ;;
+
+        let process_primitive prim (tracers : Partial_eval_tracer.t Nonempty_list.t) =
+          let are_all_tracers_known =
+            Nonempty_list.for_all tracers ~f:(fun { partial_value; recipe = _; id = _ } ->
+              match partial_value with
+              | Known _ -> true
+              | Unknown _ -> false)
+          in
+          if are_all_tracers_known
+          then
+            Nonempty_list.map tracers ~f:Tracer.full_lower
+            |> bind prim
+            |> Nonempty_list.map ~f:tracer_of_value
+          else (
+            match prim with
+            (* TODO: fillme with partial_eval_rules? *)
+            | _ ->
+              let tracers_in = Nonempty_list.map tracers ~f:instantiate_const in
+              let avals_in =
+                Nonempty_list.map tracers_in ~f:Partial_eval_tracer.shaped_array
+              in
+              let avals_out = abstract_eval prim avals_in in
+              let rec tracers_out =
+                lazy
+                  (Nonempty_list.map avals_out ~f:(fun shaped_array ->
+                     Partial_eval_tracer.create
+                       ~partial_value:(Unknown { shaped_array })
+                       ~recipe:(Some (force eqn))))
+              and eqn =
+                lazy
+                  (Jaxpr_recipe.create
+                     (Jaxpr_eqn
+                        { prim; tracers_in; avals_out; tracer_refs_out = tracers_out }))
+              in
+              force tracers_out)
+        ;;
+      end)
+  in
+  force interpreter
+;;
+
+let topological_sort
+  (type a)
+  ((module Node : Topological_sort.Node with type t = a) as node_module)
+  nodes
+  ~parents
+  =
+  let nodes = List.stable_dedup nodes ~compare:Node.compare in
+  let edges =
+    List.concat_map nodes ~f:(fun child ->
+      parents child
+      |> List.map ~f:(fun parent -> { Topological_sort.Edge.from = parent; to_ = child }))
+  in
+  Topological_sort.sort node_module ~what:Nodes_and_edge_endpoints ~nodes ~edges
+  |> Or_error.ok_exn
+;;
+
+let tracers_to_jaxpr
+  ~(tracers_in : Partial_eval_tracer.t list)
+  ~(tracers_out : Partial_eval_tracer.t list)
+  =
+  let tracer_to_var =
+    List.map tracers_in ~f:(fun tracer ->
+      tracer.id, Var.create (Partial_eval_tracer.shaped_array tracer))
+    |> Partial_eval_tracer.Id.Map.of_alist_exn
+  in
+  let module Accum = struct
+    type t =
+      { tracer_to_var : Var.t Partial_eval_tracer.Id.Map.t
+      ; constid_to_var : Var.t Value.Id.Map.t
+      ; constvar_to_val : Value.t Var.Id.Map.t
+      ; processed_eqns : Jaxpr_recipe.Id.Set.t
+      ; eqns : Jaxpr.Eqn.t list
+      }
+  end
+  in
+  let { Accum.tracer_to_var
+      ; constid_to_var = _
+      ; constvar_to_val
+      ; processed_eqns = _
+      ; eqns
+      }
+    =
+    if !debug then print_s [%message "" (tracers_in : Partial_eval_tracer.t list)];
+    topological_sort
+      (module Partial_eval_tracer)
+      tracers_out
+      ~parents:(fun { partial_value = _; recipe; id = _ } ->
+        match Option.map recipe ~f:Jaxpr_recipe.variant with
+        | Some (Jaxpr_eqn { prim = _; tracers_in; avals_out = _; tracer_refs_out = _ }) ->
+          Nonempty_list.to_list tracers_in
+        | Some (Lambda_binding | Const_recipe _) | None -> [])
+    |> List.fold
+         ~init:
+           { Accum.tracer_to_var
+           ; constid_to_var = Value.Id.Map.empty
+           ; constvar_to_val = Var.Id.Map.empty
+           ; processed_eqns = Jaxpr_recipe.Id.Set.empty
+           ; eqns = []
+           }
+         ~f:
+           (fun
+             ({ tracer_to_var; constid_to_var; constvar_to_val; processed_eqns; eqns } as
+              accum)
+             { partial_value = _; recipe; id }
+           ->
+           let { Jaxpr_recipe.id = recipe_id; variant } = Option.value_exn recipe in
+           match variant with
+           | Lambda_binding ->
+             assert (
+               List.exists tracers_in ~f:(fun tracer ->
+                 Partial_eval_tracer.Id.equal tracer.id id));
+             accum
+           | Const_recipe value ->
+             let var = Map.find constid_to_var (Value.id value) in
+             (match var with
+              | Some var ->
+                { accum with tracer_to_var = Map.add_exn tracer_to_var ~key:id ~data:var }
+              | None ->
+                let var =
+                  Value.get_aval value |> Abstract_value.shaped_array |> Var.create
+                in
+                { accum with
+                  tracer_to_var = Map.add_exn tracer_to_var ~key:id ~data:var
+                ; constid_to_var =
+                    Map.add_exn constid_to_var ~key:(Value.id value) ~data:var
+                ; constvar_to_val =
+                    Map.add_exn constvar_to_val ~key:(Var.id var) ~data:value
+                })
+           | Jaxpr_eqn
+               { prim; tracers_in; avals_out; tracer_refs_out = (lazy tracer_refs_out) }
+             ->
+             (match Set.mem processed_eqns recipe_id with
+              | true -> accum
+              | false ->
+                let tracer_to_var, eqn =
+                  if !debug
+                  then
+                    print_s
+                      [%message "" (tracer_to_var : Var.t Partial_eval_tracer.Id.Map.t)];
+                  let inputs =
+                    Nonempty_list.map tracers_in ~f:(fun tracer ->
+                      Map.find_exn tracer_to_var tracer.id |> Atom.Var)
+                  in
+                  let out_binders = Nonempty_list.map avals_out ~f:Var.create in
+                  let tracer_to_var =
+                    Nonempty_list.zip_exn tracer_refs_out out_binders
+                    |> Nonempty_list.fold
+                         ~init:tracer_to_var
+                         ~f:(fun tracer_to_var (tracer, var) ->
+                           Map.add_exn tracer_to_var ~key:tracer.id ~data:var)
+                  in
+                  tracer_to_var, { Jaxpr.Eqn.prim; inputs; out_binders }
+                in
+                { accum with
+                  tracer_to_var
+                ; processed_eqns = Set.add processed_eqns recipe_id
+                ; eqns = eqn :: eqns
+                }))
+  in
+  let constvars, constvals = Map.to_alist constvar_to_val |> List.unzip in
+  let in_binders =
+    List.map constvars ~f:Var.lookup
+    @ List.map tracers_in ~f:(fun tracer -> Map.find_exn tracer_to_var tracer.id)
+    |> Nonempty_list.of_list_exn
+  in
+  let out_vars =
+    List.map tracers_out ~f:(fun tracer ->
+      Map.find_exn tracer_to_var tracer.id |> Atom.Var)
+    |> Nonempty_list.of_list_exn
+  in
+  let jaxpr = { Jaxpr.in_binders; eqns; outs = out_vars } in
+  ignore (Jaxpr.typecheck jaxpr : Jaxpr.Type.t);
+  jaxpr, constvals
+;;
+
+let partial_eval ~f pvals_in =
+  new_interpreter
+    ~create_interpreter:partial_eval_interpreter
+    ~global_data:()
+    ~f:(fun interpreter ->
+      let tracers_in = Nonempty_list.map pvals_in ~f:Partial_eval_tracer.new_arg in
+      let outs =
+        Nonempty_list.map tracers_in ~f:(fun tracer ->
+          Value.of_tracer (T { tracer; interpreter }))
+        |> f
+      in
+      let tracers_out = Nonempty_list.map outs ~f:(Value.full_raise interpreter) in
+      let partial_values =
+        Nonempty_list.map tracers_out ~f:(fun tracer -> tracer.partial_value)
+      in
+      let filter_out_known =
+        Nonempty_list.filter ~f:(fun (tracer : Partial_eval_tracer.t) ->
+          match tracer.partial_value with
+          | Known _ -> false
+          | Unknown _ -> true)
+      in
+      let unknown_tracers_in = filter_out_known tracers_in in
+      let unknown_tracers_out = filter_out_known tracers_out in
+      let jaxpr, consts =
+        tracers_to_jaxpr ~tracers_in:unknown_tracers_in ~tracers_out:unknown_tracers_out
+      in
+      jaxpr, partial_values, consts)
+;;
+
+let linearize ~f primals_in =
+  let pvals_in =
+    Nonempty_list.concat
+      [ Nonempty_list.map primals_in ~f:(fun primal ->
+          Partial_value.Known
+            { shaped_array = Value.get_aval primal |> Abstract_value.shaped_array
+            ; const = primal
+            })
+      ; Nonempty_list.map primals_in ~f:(fun primal ->
+          Partial_value.Unknown
+            { shaped_array = Value.get_aval primal |> Abstract_value.shaped_array })
+      ]
+  in
+  let jaxpr, pvals_out, consts =
+    partial_eval
+      ~f:(fun primals_tangents_in ->
+        let primals_in, tangents_in =
+          List.split_n
+            (Nonempty_list.to_list primals_tangents_in)
+            (Nonempty_list.length primals_tangents_in / 2)
+          |> Tuple2.map ~f:Nonempty_list.of_list_exn
+        in
+        let primals_out, tangents_out =
+          jvp ~f primals_in tangents_in
+          |> Nonempty_list.map ~f:(fun { primal; tangent } -> primal, tangent)
+          |> Nonempty_list.unzip
+        in
+        Nonempty_list.concat [ primals_out; tangents_out ])
+      pvals_in
+  in
+  let primal_pvals =
+    List.take (Nonempty_list.to_list pvals_out) (Nonempty_list.length pvals_out / 2)
+  in
+  let primals_out =
+    List.map primal_pvals ~f:(function
+      | Known { shaped_array = _; const } -> const
+      | Unknown { shaped_array = _ } ->
+        raise_s
+          [%message
+            "unexpected unknown priaml partial value"
+              (primal_pvals : Partial_value.t list)])
+  in
+  let f_lin tangents = Jaxpr.eval jaxpr (consts @* tangents) in
+  primals_out, f_lin
+;;
+
+let linearize1 ~f value =
+  match
+    linearize
+      ~f:(function
+        | [ x ] -> [ f x ]
+        | _ -> assert false)
+      (Nonempty_list.singleton value)
+  with
+  | [ y ], f_lin ->
+    ( y
+    , fun t ->
+        (match f_lin (Nonempty_list.singleton t) with
+         | [ t ] -> t
+         | _ -> assert false) )
+  | _ -> assert false
+;;
+
+let%expect_test "linearize" =
+  let y, sin_lin = linearize1 ~f:sin (Value.of_float 3.) in
+  [%sexp_of: Value.Hide_id.t * Value.Hide_id.t] (y, sin (Value.of_float 3.)) |> print_s;
+  [%expect {| ((Tensor 0.14112000805986721) (Tensor 0.14112000805986721)) |}];
+  [%sexp_of: Value.Hide_id.t * Value.Hide_id.t]
+    (sin_lin (Value.of_float 1.), cos (Value.of_float 3.))
+  |> print_s;
+  [%expect {| ((Tensor -0.98999249660044542) (Tensor -0.98999249660044542)) |}]
 ;;
