@@ -2268,18 +2268,31 @@ let%expect_test "grad1" =
   Called from Autodidax_ocaml__Jax.tracers_to_jaxpr.(fun) in file "lib/jax.ml", line 1633, characters 20-138
   Called from Base__List0.fold in file "src/list0.ml", line 43, characters 27-37
   Called from Autodidax_ocaml__Jax.tracers_to_jaxpr in file "lib/jax.ml", line 1576, characters 4-1023
-  Called from Autodidax_ocaml__Jax.partial_eval.(fun) in file "lib/jax.ml", line 1692, characters 8-88
+  Called from Autodidax_ocaml__Jax.partial_eval.(fun) in file "lib/jax.ml", line 1699, characters 8-88
   Called from Base__Exn.protectx in file "src/exn.ml", line 79, characters 8-11
   Re-raised at Base__Exn.raise_with_original_backtrace in file "src/exn.ml" (inlined), line 59, characters 2-50
   Called from Base__Exn.protectx in file "src/exn.ml", line 86, characters 13-49
-  Called from Autodidax_ocaml__Jax.vjp in file "lib/jax.ml", line 2164, characters 4-571
-  Called from Autodidax_ocaml__Jax.vjp1 in file "lib/jax.ml", line 2204, characters 4-98
-  Called from Autodidax_ocaml__Jax.grad1.(fun) in file "lib/jax.ml", line 2233, characters 19-28
-  Called from Autodidax_ocaml__Jax.(fun) in file "lib/jax.ml", line 2249, characters 2-28
+  Called from Autodidax_ocaml__Jax.vjp in file "lib/jax.ml", line 2171, characters 4-571
+  Called from Autodidax_ocaml__Jax.vjp1 in file "lib/jax.ml", line 2211, characters 4-98
+  Called from Autodidax_ocaml__Jax.grad1.(fun) in file "lib/jax.ml", line 2240, characters 19-28
+  Called from Autodidax_ocaml__Jax.(fun) in file "lib/jax.ml", line 2256, characters 2-28
   Called from Ppx_expect_runtime__Test_block.Configured.dump_backtrace in file "runtime/test_block.ml", line 142, characters 10-28
 
   Trailing output
   ---------------
+  ((pvals_in
+    ((Known (shaped_array ((dims ())))
+      (const ((id (Jax.Value 661)) (value (Tensor 3)))))
+     (Unknown (shaped_array ((dims ()))))))
+   (tracers_in
+    (((partial_value
+       (Known (shaped_array ((dims ())))
+        (const ((id (Jax.Value 661)) (value (Tensor 3))))))
+      (recipe (((id (Jax.Jaxpr_recipe 13)) (variant Lambda_binding))))
+      (id (Jax.Partial_eval_tracer 25)))
+     ((partial_value (Unknown (shaped_array ((dims ())))))
+      (recipe (((id (Jax.Jaxpr_recipe 14)) (variant Lambda_binding))))
+      (id (Jax.Partial_eval_tracer 26))))))
   (bind (prim Sin)
    (values
     (((id (Jax.Value 664))
