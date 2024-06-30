@@ -239,7 +239,7 @@ end = struct
 end
 
 and Value : sig
-  type t [@@deriving sexp_of]
+  type t [@@deriving sexp_of, compare]
 
   module Id : Comparable.S
 
@@ -279,6 +279,7 @@ end = struct
   let of_tracer tracer = { id = Id.create (); value = `Tracer tracer }
   let get t = t.value
   let id t = t.id
+  let compare = Comparable.lift [%compare: Id.t] ~f:id
 
   let get_aval t =
     match get t with
@@ -305,7 +306,8 @@ end = struct
     | `Tracer (T { tracer; interpreter = (module Interpreter_to_lift) } as packed_tracer)
       ->
       (match
-         Ordering.of_int (compare Interpreter.Level.level Interpreter_to_lift.Level.level)
+         Ordering.of_int
+           (Int.compare Interpreter.Level.level Interpreter_to_lift.Level.level)
        with
        | Equal ->
          let T =
@@ -386,7 +388,7 @@ let bind prim values =
   then (
     print_s [%message "bind" (prim : Primitive.t) (values : Value.t Nonempty_list.t)];
     match prim with
-    | Xla_call { jaxpr; num_consts = _ } ->
+    | Primitive.Xla_call { jaxpr; num_consts = _ } ->
       Set_once.get_exn jaxpr_to_string [%here] jaxpr |> print_endline
     | _ -> ());
   Interpreter.process_primitive prim tracers
@@ -1264,6 +1266,10 @@ module Partial_value = struct
         }
     | Unknown of { shaped_array : Shaped_array.t }
   [@@deriving sexp_of]
+
+  let shaped_array = function
+    | Known { shaped_array; const = _ } | Unknown { shaped_array } -> shaped_array
+  ;;
 end
 
 module rec Jaxpr_recipe_variant : sig
@@ -1274,7 +1280,7 @@ module rec Jaxpr_recipe_variant : sig
         { prim : Primitive.t
         ; tracers_in : Partial_eval_tracer.t Nonempty_list.t
         ; avals_out : Shaped_array.t Nonempty_list.t
-        ; tracer_refs_out : Partial_eval_tracer.t Nonempty_list.t lazy_t
+        ; tracer_refs_out : Partial_eval_tracer.t Nonempty_list.t Lazy.t
         }
   [@@deriving sexp_of]
 end = struct
@@ -1285,7 +1291,7 @@ end = struct
         { prim : Primitive.t
         ; tracers_in : Partial_eval_tracer.t Nonempty_list.t
         ; avals_out : Shaped_array.t Nonempty_list.t
-        ; tracer_refs_out : Partial_eval_tracer.t Nonempty_list.t lazy_t
+        ; tracer_refs_out : (Partial_eval_tracer.t[@sexp.opaque]) Nonempty_list.t Lazy.t
         }
   [@@deriving sexp_of]
 end
@@ -1665,6 +1671,13 @@ let partial_eval ~f pvals_in =
     ~global_data:()
     ~f:(fun interpreter ->
       let tracers_in = Nonempty_list.map pvals_in ~f:Partial_eval_tracer.new_arg in
+      if !debug
+      then
+        print_s
+          [%message
+            ""
+              (pvals_in : Partial_value.t Nonempty_list.t)
+              (tracers_in : Partial_eval_tracer.t Nonempty_list.t)];
       let outs =
         Nonempty_list.map tracers_in ~f:(fun tracer ->
           Value.of_tracer (T { tracer; interpreter }))
@@ -1951,6 +1964,14 @@ let rec partial_eval_jaxpr jaxpr ~in_unknowns =
     ~unks_out:out_unknowns
     ~jaxpr1
     ~jaxpr2;
+  if !debug
+  then (
+    print_endline "input jaxpr:";
+    Jaxpr.to_string jaxpr |> print_endline;
+    print_endline "jaxpr1:";
+    Jaxpr.to_string jaxpr1 |> print_endline;
+    print_endline "jaxpr2:";
+    Jaxpr.to_string jaxpr2 |> print_endline);
   jaxpr1, jaxpr2, out_unknowns, List.length residuals
 ;;
 
@@ -1967,4 +1988,825 @@ let%expect_test "jit+linearize" =
   let y_dot = f_lin (Value.of_float 1.) in
   [%sexp_of: Value.Hide_id.t * Value.Hide_id.t] (y, y_dot) |> print_s;
   [%expect {| ((Tensor 2.7177599838802657) (Tensor 2.9799849932008908)) |}]
+;;
+
+module Undef_primal = struct
+  type 'a t =
+    | Undef_primal of Shaped_array.t
+    | Other of 'a
+  [@@deriving sexp_of]
+end
+
+let reconstruct_args_and_cotangents =
+  let rec go
+    accum_args
+    (is_undef_primal : _ list)
+    (args_and_cotangents : _ Nonempty_list.t)
+    =
+    match is_undef_primal, args_and_cotangents with
+    | [], _ -> Nonempty_list.of_list_exn (List.rev accum_args), args_and_cotangents
+    | Some aval :: is_undef_primal, _ ->
+      go
+        (Undef_primal.Undef_primal aval :: accum_args)
+        is_undef_primal
+        args_and_cotangents
+    | None :: is_undef_primal, arg :: args_and_cotangents ->
+      (match Nonempty_list.of_list args_and_cotangents with
+       | None -> assert false
+       | Some args_and_cotangents ->
+         go (Other arg :: accum_args) is_undef_primal args_and_cotangents)
+  in
+  fun is_undef_primal args_and_cotangents ->
+    go [] (Nonempty_list.to_list is_undef_primal) args_and_cotangents
+;;
+
+let rec eval_jaxpr_transposed jaxpr ~args ~cotangents =
+  let { Jaxpr.in_binders; eqns; outs } = jaxpr in
+  let primal_env =
+    Nonempty_list.zip_exn in_binders args
+    |> Nonempty_list.fold ~init:Var.Id.Map.empty ~f:(fun primal_env (var, arg) ->
+      match arg with
+      | Undef_primal.Undef_primal _ -> primal_env
+      | Other _ -> Map.add_exn primal_env ~key:(Var.id var) ~data:arg)
+  in
+  let write_cotangent ct_env atom ct =
+    match atom, ct with
+    | Atom.Lit _, _ | Var _, None -> ct_env
+    | Var var, Some ct ->
+      Map.update ct_env (Var.id var) ~f:(function
+        | None -> ct
+        | Some ct' -> ct + ct')
+  in
+  let read_cotangent ct_env var =
+    match Map.find ct_env (Var.id var) with
+    | None -> ct_env, Value.of_tensor (Tensor.zeros ~dims:(Var.shaped_array var).dims)
+    | Some ct -> Map.remove ct_env (Var.id var), ct
+  in
+  let ct_env =
+    Nonempty_list.zip_exn outs cotangents
+    |> Nonempty_list.fold ~init:Var.Id.Map.empty ~f:(fun ct_env (atom, ct) ->
+      write_cotangent ct_env atom (Some ct))
+  in
+  let ct_env =
+    List.rev eqns
+    |> List.fold ~init:ct_env ~f:(fun ct_env { prim; inputs; out_binders } ->
+      let primals_in =
+        Nonempty_list.map inputs ~f:(function
+          | Atom.Var var ->
+            Map.find primal_env (Var.id var)
+            |> Option.value ~default:(Undef_primal.Undef_primal (Var.shaped_array var))
+          | Lit v -> Other (Value.of_tensor v))
+      in
+      let ct_env, cts_in =
+        Nonempty_list.fold_map out_binders ~init:ct_env ~f:read_cotangent
+      in
+      let (cts_out : _ Nonempty_list.t) =
+        match prim, cts_in, primals_in with
+        | Mul, [ z_bar ], [ Undef_primal _a; Other b ] -> [ Some (z_bar * b); None ]
+        | Mul, [ z_bar ], [ Other a; Undef_primal _b ] -> [ None; Some (a * z_bar) ]
+        | Neg, [ y_bar ], [ Undef_primal _ ] -> [ Some (-y_bar) ]
+        | Add, [ z_bar ], [ _; _ ] -> [ Some z_bar; Some z_bar ]
+        | Xla_call { jaxpr; num_consts = _ }, cts, primals_in ->
+          let undef_primals =
+            Nonempty_list.map primals_in ~f:(function
+              | Undef_primal.Undef_primal _ -> true
+              | Other _ -> false)
+          in
+          let transposed_jaxpr, new_consts = transpose_jaxpr jaxpr ~undef_primals in
+          let residuals =
+            Nonempty_list.filter_map primals_in ~f:(function
+              | Undef_primal.Undef_primal _ -> None
+              | Other primal -> Some primal)
+          in
+          let outs =
+            bind
+              (Xla_call { jaxpr = transposed_jaxpr; num_consts = List.length new_consts })
+              ((new_consts @ residuals) @* cts)
+          in
+          let outs_remainder, cts_out =
+            Nonempty_list.fold_map
+              undef_primals
+              ~init:(Nonempty_list.to_list outs)
+              ~f:(fun outs_remainder is_undef_primal ->
+                match outs_remainder, is_undef_primal with
+                | [], true ->
+                  raise_s
+                    [%message
+                      "unexpectedly fewer outs than undef primals"
+                        (primals_in : Value.t Undef_primal.t Nonempty_list.t)
+                        (outs : Value.t Nonempty_list.t)]
+                | out :: outs_remainder, true -> outs_remainder, Some out
+                | outs_remainder, false -> outs_remainder, None)
+          in
+          [%test_result: Value.t list] outs_remainder ~expect:[];
+          cts_out
+        | _ ->
+          raise_s
+            [%message
+              "unexpected primitive"
+                (prim : Primitive.t)
+                (cts_in : Value.t Nonempty_list.t)
+                (primals_in : Value.t Undef_primal.t Nonempty_list.t)]
+      in
+      let ct_env =
+        Nonempty_list.zip_exn inputs cts_out
+        |> Nonempty_list.fold ~init:ct_env ~f:(fun ct_env (input, ct) ->
+          write_cotangent ct_env input ct)
+      in
+      ct_env)
+  in
+  let _ct_env, cotangents =
+    Nonempty_list.zip_exn in_binders args
+    |> Nonempty_list.fold_map ~init:ct_env ~f:(fun ct_env (var, arg) ->
+      match arg with
+      | Undef_primal.Undef_primal _ ->
+        let ct_env, ct = read_cotangent ct_env var in
+        ct_env, Some ct
+      | Other _ -> ct_env, None)
+    |> Tuple2.map_snd ~f:(Nonempty_list.filter_map ~f:Fn.id)
+  in
+  Nonempty_list.of_list_exn cotangents
+
+and transpose_jaxpr jaxpr ~undef_primals =
+  let { Jaxpr.Type.in_types; out_types } = Jaxpr.typecheck jaxpr in
+  let args =
+    Nonempty_list.zip_exn in_types undef_primals
+    |> Nonempty_list.map ~f:(fun (aval, undef_primal) ->
+      if undef_primal then Undef_primal.Undef_primal aval else Other aval)
+  in
+  let is_undef_primal =
+    Nonempty_list.map args ~f:(function
+      | Undef_primal.Undef_primal aval -> Some aval
+      | Other _ -> None)
+  in
+  let trans_jaxpr, consts =
+    make_jaxpr
+      ~f:(fun args_and_cotangents ->
+        let args, cotangents =
+          reconstruct_args_and_cotangents is_undef_primal args_and_cotangents
+        in
+        eval_jaxpr_transposed jaxpr ~args ~cotangents)
+      (Nonempty_list.filter_map args ~f:(function
+         | Undef_primal.Undef_primal _ -> None
+         | Other aval -> Some aval)
+       @* out_types)
+  in
+  ignore (Jaxpr.typecheck trans_jaxpr : Jaxpr.Type.t);
+  trans_jaxpr, consts
+;;
+
+let vjp ~f primals_in =
+  let primal_pvals_in, tangent_pvals_in =
+    ( Nonempty_list.map primals_in ~f:(fun primal ->
+        Partial_value.Known
+          { shaped_array = Value.get_aval primal |> Abstract_value.shaped_array
+          ; const = primal
+          })
+    , Nonempty_list.map primals_in ~f:(fun primal ->
+        Partial_value.Unknown
+          { shaped_array = Value.get_aval primal |> Abstract_value.shaped_array }) )
+  in
+  let pvals_in = Nonempty_list.concat [ primal_pvals_in; tangent_pvals_in ] in
+  let jaxpr, pvals_out, consts =
+    partial_eval
+      ~f:(fun primals_tangents_in ->
+        let primals_in, tangents_in =
+          List.split_n
+            (Nonempty_list.to_list primals_tangents_in)
+            (Nonempty_list.length primals_tangents_in / 2)
+          |> Tuple2.map ~f:Nonempty_list.of_list_exn
+        in
+        let primals_out, tangents_out =
+          jvp ~f primals_in tangents_in
+          |> Nonempty_list.map ~f:(fun { primal; tangent } -> primal, tangent)
+          |> Nonempty_list.unzip
+        in
+        Nonempty_list.concat [ primals_out; tangents_out ])
+      pvals_in
+  in
+  let primal_pvals =
+    List.take (Nonempty_list.to_list pvals_out) (Nonempty_list.length pvals_out / 2)
+    |> Nonempty_list.of_list_exn
+  in
+  let primals_out =
+    Nonempty_list.map primal_pvals ~f:(function
+      | Partial_value.Known { shaped_array = _; const } -> const
+      | Unknown { shaped_array = _ } ->
+        raise_s
+          [%message
+            "unexpected unknown priaml partial value"
+              (primal_pvals : Partial_value.t Nonempty_list.t)])
+  in
+  let transpose_inputs =
+    List.map consts ~f:(fun const -> Undef_primal.Other const)
+    @* Nonempty_list.map tangent_pvals_in ~f:(fun pval ->
+      Undef_primal.Undef_primal (Partial_value.shaped_array pval))
+  in
+  let f_vjp cts = eval_jaxpr_transposed jaxpr ~args:transpose_inputs ~cotangents:cts in
+  primals_out, f_vjp
+;;
+
+let vjp1 ~f value =
+  match
+    vjp
+      ~f:(function
+        | [ x ] -> [ f x ]
+        | _ -> assert false)
+      [ value ]
+  with
+  | [ y ], f_vjp ->
+    ( y
+    , fun t ->
+        (match f_vjp (Nonempty_list.singleton t) with
+         | [ t ] -> t
+         | _ -> assert false) )
+  | _ -> assert false
+;;
+
+let%expect_test "vjp" =
+  let y, f_vjp = vjp1 ~f:sin (Value.of_float 3.) in
+  [%sexp_of: Value.Hide_id.t * Value.Hide_id.t * Value.Hide_id.t]
+    (y, f_vjp (Value.of_float 1.), cos (Value.of_float 3.))
+  |> print_s;
+  [%expect
+    {|
+    ((Tensor 0.14112000805986721) (Tensor -0.98999249660044542)
+     (Tensor -0.98999249660044542))
+    |}]
+;;
+
+let grad1 ~f =
+  Staged.stage (fun x ->
+    let y, f_vjp = vjp1 ~f x in
+    let y_bar =
+      Value.of_tensor
+        (Tensor.ones ~dims:(Value.get_aval y |> Abstract_value.shaped_array).dims)
+    in
+    f_vjp y_bar)
+;;
+
+let%expect_test "grad1" =
+  let f x =
+    let y = sin x * Value.of_float 2. in
+    let z = -y + x in
+    z
+  in
+  debug := true;
+  let f_grad = grad1 ~f |> Staged.unstage in
+  f_grad (Value.of_float 3.) |> [%sexp_of: Value.Hide_id.t] |> print_s;
+  [%expect.unreachable]
+[@@expect.uncaught_exn
+  {|
+  (* CR expect_test_collector: This test expectation appears to contain a backtrace.
+     This is strongly discouraged as backtraces are fragile.
+     Please change this test to not include a backtrace. *)
+  (Not_found_s ("Map.find_exn: not found" (Jax.Partial_eval_tracer 37)))
+  Raised at Base__Map.Tree0.find_exn.if_not_found in file "src/map.ml", line 632, characters 6-84
+  Called from Base__Map.Accessors.find_exn in file "src/map.ml" (inlined), line 2202, characters 4-118
+  Called from Autodidax_ocaml__Jax.tracers_to_jaxpr.(fun) in file "lib/jax.ml", line 1634, characters 22-58
+  Called from Nonempty_list.mapi in file "nonempty_list/src/nonempty_list.ml", line 251, characters 11-17
+  Called from Autodidax_ocaml__Jax.tracers_to_jaxpr.(fun) in file "lib/jax.ml", line 1633, characters 20-138
+  Called from Base__List0.fold in file "src/list0.ml", line 43, characters 27-37
+  Called from Autodidax_ocaml__Jax.tracers_to_jaxpr in file "lib/jax.ml", line 1576, characters 4-1023
+  Called from Autodidax_ocaml__Jax.partial_eval.(fun) in file "lib/jax.ml", line 1699, characters 8-88
+  Called from Base__Exn.protectx in file "src/exn.ml", line 79, characters 8-11
+  Re-raised at Base__Exn.raise_with_original_backtrace in file "src/exn.ml" (inlined), line 59, characters 2-50
+  Called from Base__Exn.protectx in file "src/exn.ml", line 86, characters 13-49
+  Called from Autodidax_ocaml__Jax.vjp in file "lib/jax.ml", line 2171, characters 4-571
+  Called from Autodidax_ocaml__Jax.vjp1 in file "lib/jax.ml", line 2211, characters 4-98
+  Called from Autodidax_ocaml__Jax.grad1.(fun) in file "lib/jax.ml", line 2240, characters 19-28
+  Called from Autodidax_ocaml__Jax.(fun) in file "lib/jax.ml", line 2256, characters 2-28
+  Called from Ppx_expect_runtime__Test_block.Configured.dump_backtrace in file "runtime/test_block.ml", line 142, characters 10-28
+
+  Trailing output
+  ---------------
+  ((pvals_in
+    ((Known (shaped_array ((dims ())))
+      (const ((id (Jax.Value 661)) (value (Tensor 3)))))
+     (Unknown (shaped_array ((dims ()))))))
+   (tracers_in
+    (((partial_value
+       (Known (shaped_array ((dims ())))
+        (const ((id (Jax.Value 661)) (value (Tensor 3))))))
+      (recipe (((id (Jax.Jaxpr_recipe 13)) (variant Lambda_binding))))
+      (id (Jax.Partial_eval_tracer 25)))
+     ((partial_value (Unknown (shaped_array ((dims ())))))
+      (recipe (((id (Jax.Jaxpr_recipe 14)) (variant Lambda_binding))))
+      (id (Jax.Partial_eval_tracer 26))))))
+  (bind (prim Sin)
+   (values
+    (((id (Jax.Value 664))
+      (value
+       (Tracer
+        (jvp_interpreter
+         ((primal
+           ((id (Jax.Value 662))
+            (value
+             (Tracer
+              (partial_eval_interpreter
+               ((partial_value
+                 (Known (shaped_array ((dims ())))
+                  (const ((id (Jax.Value 661)) (value (Tensor 3))))))
+                (recipe
+                 (((id (Jax.Jaxpr_recipe 13)) (variant Lambda_binding))))
+                (id (Jax.Partial_eval_tracer 25))))))))
+          (tangent
+           ((id (Jax.Value 663))
+            (value
+             (Tracer
+              (partial_eval_interpreter
+               ((partial_value (Unknown (shaped_array ((dims ())))))
+                (recipe
+                 (((id (Jax.Jaxpr_recipe 14)) (variant Lambda_binding))))
+                (id (Jax.Partial_eval_tracer 26))))))))))))))))
+  (bind (prim Cos)
+   (values
+    (((id (Jax.Value 662))
+      (value
+       (Tracer
+        (partial_eval_interpreter
+         ((partial_value
+           (Known (shaped_array ((dims ())))
+            (const ((id (Jax.Value 661)) (value (Tensor 3))))))
+          (recipe (((id (Jax.Jaxpr_recipe 13)) (variant Lambda_binding))))
+          (id (Jax.Partial_eval_tracer 25))))))))))
+  (bind (prim Cos) (values (((id (Jax.Value 661)) (value (Tensor 3))))))
+  (bind (prim Mul)
+   (values
+    (((id (Jax.Value 666)) (value (Tensor -0.98999249660044542)))
+     ((id (Jax.Value 663))
+      (value
+       (Tracer
+        (partial_eval_interpreter
+         ((partial_value (Unknown (shaped_array ((dims ())))))
+          (recipe (((id (Jax.Jaxpr_recipe 14)) (variant Lambda_binding))))
+          (id (Jax.Partial_eval_tracer 26))))))))))
+  (bind (prim Sin)
+   (values
+    (((id (Jax.Value 662))
+      (value
+       (Tracer
+        (partial_eval_interpreter
+         ((partial_value
+           (Known (shaped_array ((dims ())))
+            (const ((id (Jax.Value 661)) (value (Tensor 3))))))
+          (recipe (((id (Jax.Jaxpr_recipe 13)) (variant Lambda_binding))))
+          (id (Jax.Partial_eval_tracer 25))))))))))
+  (bind (prim Sin) (values (((id (Jax.Value 661)) (value (Tensor 3))))))
+  (bind (prim Mul)
+   (values
+    (((id (Jax.Value 670))
+      (value
+       (Tracer
+        (jvp_interpreter
+         ((primal ((id (Jax.Value 669)) (value (Tensor 0.14112000805986721))))
+          (tangent
+           ((id (Jax.Value 668))
+            (value
+             (Tracer
+              (partial_eval_interpreter
+               ((partial_value (Unknown (shaped_array ((dims ())))))
+                (recipe
+                 (((id (Jax.Jaxpr_recipe 16))
+                   (variant
+                    (Jaxpr_eqn (prim Mul)
+                     (tracers_in
+                      (((partial_value (Unknown (shaped_array ((dims ())))))
+                        (recipe
+                         (((id (Jax.Jaxpr_recipe 15))
+                           (variant
+                            (Const_recipe
+                             ((id (Jax.Value 667))
+                              (value (Tensor -0.98999249660044542))))))))
+                        (id (Jax.Partial_eval_tracer 29)))
+                       ((partial_value (Unknown (shaped_array ((dims ())))))
+                        (recipe
+                         (((id (Jax.Jaxpr_recipe 14)) (variant Lambda_binding))))
+                        (id (Jax.Partial_eval_tracer 26)))))
+                     (avals_out (((dims ())))) (tracer_refs_out (<opaque>)))))))
+                (id (Jax.Partial_eval_tracer 30)))))))))))))
+     ((id (Jax.Value 665)) (value (Tensor 2))))))
+  (bind (prim Mul)
+   (values
+    (((id (Jax.Value 668))
+      (value
+       (Tracer
+        (partial_eval_interpreter
+         ((partial_value (Unknown (shaped_array ((dims ())))))
+          (recipe
+           (((id (Jax.Jaxpr_recipe 16))
+             (variant
+              (Jaxpr_eqn (prim Mul)
+               (tracers_in
+                (((partial_value (Unknown (shaped_array ((dims ())))))
+                  (recipe
+                   (((id (Jax.Jaxpr_recipe 15))
+                     (variant
+                      (Const_recipe
+                       ((id (Jax.Value 667))
+                        (value (Tensor -0.98999249660044542))))))))
+                  (id (Jax.Partial_eval_tracer 29)))
+                 ((partial_value (Unknown (shaped_array ((dims ())))))
+                  (recipe
+                   (((id (Jax.Jaxpr_recipe 14)) (variant Lambda_binding))))
+                  (id (Jax.Partial_eval_tracer 26)))))
+               (avals_out (((dims ())))) (tracer_refs_out (<opaque>)))))))
+          (id (Jax.Partial_eval_tracer 30)))))))
+     ((id (Jax.Value 671)) (value (Tensor 2))))))
+  (bind (prim Mul)
+   (values
+    (((id (Jax.Value 669)) (value (Tensor 0.14112000805986721)))
+     ((id (Jax.Value 672)) (value (Tensor 0))))))
+  (bind (prim Add)
+   (values
+    (((id (Jax.Value 675)) (value (Tensor 0)))
+     ((id (Jax.Value 674))
+      (value
+       (Tracer
+        (partial_eval_interpreter
+         ((partial_value (Unknown (shaped_array ((dims ())))))
+          (recipe
+           (((id (Jax.Jaxpr_recipe 18))
+             (variant
+              (Jaxpr_eqn (prim Mul)
+               (tracers_in
+                (((partial_value (Unknown (shaped_array ((dims ())))))
+                  (recipe
+                   (((id (Jax.Jaxpr_recipe 16))
+                     (variant
+                      (Jaxpr_eqn (prim Mul)
+                       (tracers_in
+                        (((partial_value (Unknown (shaped_array ((dims ())))))
+                          (recipe
+                           (((id (Jax.Jaxpr_recipe 15))
+                             (variant
+                              (Const_recipe
+                               ((id (Jax.Value 667))
+                                (value (Tensor -0.98999249660044542))))))))
+                          (id (Jax.Partial_eval_tracer 29)))
+                         ((partial_value (Unknown (shaped_array ((dims ())))))
+                          (recipe
+                           (((id (Jax.Jaxpr_recipe 14))
+                             (variant Lambda_binding))))
+                          (id (Jax.Partial_eval_tracer 26)))))
+                       (avals_out (((dims ())))) (tracer_refs_out (<opaque>)))))))
+                  (id (Jax.Partial_eval_tracer 30)))
+                 ((partial_value (Unknown (shaped_array ((dims ())))))
+                  (recipe
+                   (((id (Jax.Jaxpr_recipe 17))
+                     (variant
+                      (Const_recipe ((id (Jax.Value 673)) (value (Tensor 2))))))))
+                  (id (Jax.Partial_eval_tracer 33)))))
+               (avals_out (((dims ())))) (tracer_refs_out (<opaque>)))))))
+          (id (Jax.Partial_eval_tracer 34))))))))))
+  (bind (prim Mul)
+   (values
+    (((id (Jax.Value 669)) (value (Tensor 0.14112000805986721)))
+     ((id (Jax.Value 671)) (value (Tensor 2))))))
+  (bind (prim Neg)
+   (values
+    (((id (Jax.Value 679))
+      (value
+       (Tracer
+        (jvp_interpreter
+         ((primal ((id (Jax.Value 678)) (value (Tensor 0.28224001611973443))))
+          (tangent
+           ((id (Jax.Value 677))
+            (value
+             (Tracer
+              (partial_eval_interpreter
+               ((partial_value (Unknown (shaped_array ((dims ())))))
+                (recipe
+                 (((id (Jax.Jaxpr_recipe 20))
+                   (variant
+                    (Jaxpr_eqn (prim Add)
+                     (tracers_in
+                      (((partial_value (Unknown (shaped_array ((dims ())))))
+                        (recipe
+                         (((id (Jax.Jaxpr_recipe 19))
+                           (variant
+                            (Const_recipe
+                             ((id (Jax.Value 676)) (value (Tensor 0))))))))
+                        (id (Jax.Partial_eval_tracer 36)))
+                       ((partial_value (Unknown (shaped_array ((dims ())))))
+                        (recipe
+                         (((id (Jax.Jaxpr_recipe 18))
+                           (variant
+                            (Jaxpr_eqn (prim Mul)
+                             (tracers_in
+                              (((partial_value
+                                 (Unknown (shaped_array ((dims ())))))
+                                (recipe
+                                 (((id (Jax.Jaxpr_recipe 16))
+                                   (variant
+                                    (Jaxpr_eqn (prim Mul)
+                                     (tracers_in
+                                      (((partial_value
+                                         (Unknown (shaped_array ((dims ())))))
+                                        (recipe
+                                         (((id (Jax.Jaxpr_recipe 15))
+                                           (variant
+                                            (Const_recipe
+                                             ((id (Jax.Value 667))
+                                              (value
+                                               (Tensor -0.98999249660044542))))))))
+                                        (id (Jax.Partial_eval_tracer 29)))
+                                       ((partial_value
+                                         (Unknown (shaped_array ((dims ())))))
+                                        (recipe
+                                         (((id (Jax.Jaxpr_recipe 14))
+                                           (variant Lambda_binding))))
+                                        (id (Jax.Partial_eval_tracer 26)))))
+                                     (avals_out (((dims ()))))
+                                     (tracer_refs_out (<opaque>)))))))
+                                (id (Jax.Partial_eval_tracer 30)))
+                               ((partial_value
+                                 (Unknown (shaped_array ((dims ())))))
+                                (recipe
+                                 (((id (Jax.Jaxpr_recipe 17))
+                                   (variant
+                                    (Const_recipe
+                                     ((id (Jax.Value 673)) (value (Tensor 2))))))))
+                                (id (Jax.Partial_eval_tracer 33)))))
+                             (avals_out (((dims ()))))
+                             (tracer_refs_out (<opaque>)))))))
+                        (id (Jax.Partial_eval_tracer 34)))))
+                     (avals_out (((dims ())))) (tracer_refs_out (<opaque>)))))))
+                (id (Jax.Partial_eval_tracer 37))))))))))))))))
+  (bind (prim Neg)
+   (values
+    (((id (Jax.Value 677))
+      (value
+       (Tracer
+        (partial_eval_interpreter
+         ((partial_value (Unknown (shaped_array ((dims ())))))
+          (recipe
+           (((id (Jax.Jaxpr_recipe 20))
+             (variant
+              (Jaxpr_eqn (prim Add)
+               (tracers_in
+                (((partial_value (Unknown (shaped_array ((dims ())))))
+                  (recipe
+                   (((id (Jax.Jaxpr_recipe 19))
+                     (variant
+                      (Const_recipe ((id (Jax.Value 676)) (value (Tensor 0))))))))
+                  (id (Jax.Partial_eval_tracer 36)))
+                 ((partial_value (Unknown (shaped_array ((dims ())))))
+                  (recipe
+                   (((id (Jax.Jaxpr_recipe 18))
+                     (variant
+                      (Jaxpr_eqn (prim Mul)
+                       (tracers_in
+                        (((partial_value (Unknown (shaped_array ((dims ())))))
+                          (recipe
+                           (((id (Jax.Jaxpr_recipe 16))
+                             (variant
+                              (Jaxpr_eqn (prim Mul)
+                               (tracers_in
+                                (((partial_value
+                                   (Unknown (shaped_array ((dims ())))))
+                                  (recipe
+                                   (((id (Jax.Jaxpr_recipe 15))
+                                     (variant
+                                      (Const_recipe
+                                       ((id (Jax.Value 667))
+                                        (value (Tensor -0.98999249660044542))))))))
+                                  (id (Jax.Partial_eval_tracer 29)))
+                                 ((partial_value
+                                   (Unknown (shaped_array ((dims ())))))
+                                  (recipe
+                                   (((id (Jax.Jaxpr_recipe 14))
+                                     (variant Lambda_binding))))
+                                  (id (Jax.Partial_eval_tracer 26)))))
+                               (avals_out (((dims ()))))
+                               (tracer_refs_out (<opaque>)))))))
+                          (id (Jax.Partial_eval_tracer 30)))
+                         ((partial_value (Unknown (shaped_array ((dims ())))))
+                          (recipe
+                           (((id (Jax.Jaxpr_recipe 17))
+                             (variant
+                              (Const_recipe
+                               ((id (Jax.Value 673)) (value (Tensor 2))))))))
+                          (id (Jax.Partial_eval_tracer 33)))))
+                       (avals_out (((dims ())))) (tracer_refs_out (<opaque>)))))))
+                  (id (Jax.Partial_eval_tracer 34)))))
+               (avals_out (((dims ())))) (tracer_refs_out (<opaque>)))))))
+          (id (Jax.Partial_eval_tracer 37))))))))))
+  (bind (prim Neg)
+   (values (((id (Jax.Value 678)) (value (Tensor 0.28224001611973443))))))
+  (bind (prim Add)
+   (values
+    (((id (Jax.Value 682))
+      (value
+       (Tracer
+        (jvp_interpreter
+         ((primal ((id (Jax.Value 681)) (value (Tensor -0.28224001611973443))))
+          (tangent
+           ((id (Jax.Value 680))
+            (value
+             (Tracer
+              (partial_eval_interpreter
+               ((partial_value (Unknown (shaped_array ((dims ())))))
+                (recipe
+                 (((id (Jax.Jaxpr_recipe 21))
+                   (variant
+                    (Jaxpr_eqn (prim Neg)
+                     (tracers_in
+                      (((partial_value (Unknown (shaped_array ((dims ())))))
+                        (recipe
+                         (((id (Jax.Jaxpr_recipe 20))
+                           (variant
+                            (Jaxpr_eqn (prim Add)
+                             (tracers_in
+                              (((partial_value
+                                 (Unknown (shaped_array ((dims ())))))
+                                (recipe
+                                 (((id (Jax.Jaxpr_recipe 19))
+                                   (variant
+                                    (Const_recipe
+                                     ((id (Jax.Value 676)) (value (Tensor 0))))))))
+                                (id (Jax.Partial_eval_tracer 36)))
+                               ((partial_value
+                                 (Unknown (shaped_array ((dims ())))))
+                                (recipe
+                                 (((id (Jax.Jaxpr_recipe 18))
+                                   (variant
+                                    (Jaxpr_eqn (prim Mul)
+                                     (tracers_in
+                                      (((partial_value
+                                         (Unknown (shaped_array ((dims ())))))
+                                        (recipe
+                                         (((id (Jax.Jaxpr_recipe 16))
+                                           (variant
+                                            (Jaxpr_eqn (prim Mul)
+                                             (tracers_in
+                                              (((partial_value
+                                                 (Unknown
+                                                  (shaped_array ((dims ())))))
+                                                (recipe
+                                                 (((id (Jax.Jaxpr_recipe 15))
+                                                   (variant
+                                                    (Const_recipe
+                                                     ((id (Jax.Value 667))
+                                                      (value
+                                                       (Tensor
+                                                        -0.98999249660044542))))))))
+                                                (id
+                                                 (Jax.Partial_eval_tracer 29)))
+                                               ((partial_value
+                                                 (Unknown
+                                                  (shaped_array ((dims ())))))
+                                                (recipe
+                                                 (((id (Jax.Jaxpr_recipe 14))
+                                                   (variant Lambda_binding))))
+                                                (id
+                                                 (Jax.Partial_eval_tracer 26)))))
+                                             (avals_out (((dims ()))))
+                                             (tracer_refs_out (<opaque>)))))))
+                                        (id (Jax.Partial_eval_tracer 30)))
+                                       ((partial_value
+                                         (Unknown (shaped_array ((dims ())))))
+                                        (recipe
+                                         (((id (Jax.Jaxpr_recipe 17))
+                                           (variant
+                                            (Const_recipe
+                                             ((id (Jax.Value 673))
+                                              (value (Tensor 2))))))))
+                                        (id (Jax.Partial_eval_tracer 33)))))
+                                     (avals_out (((dims ()))))
+                                     (tracer_refs_out (<opaque>)))))))
+                                (id (Jax.Partial_eval_tracer 34)))))
+                             (avals_out (((dims ()))))
+                             (tracer_refs_out (<opaque>)))))))
+                        (id (Jax.Partial_eval_tracer 37)))))
+                     (avals_out (((dims ())))) (tracer_refs_out (<opaque>)))))))
+                (id (Jax.Partial_eval_tracer 38)))))))))))))
+     ((id (Jax.Value 664))
+      (value
+       (Tracer
+        (jvp_interpreter
+         ((primal
+           ((id (Jax.Value 662))
+            (value
+             (Tracer
+              (partial_eval_interpreter
+               ((partial_value
+                 (Known (shaped_array ((dims ())))
+                  (const ((id (Jax.Value 661)) (value (Tensor 3))))))
+                (recipe
+                 (((id (Jax.Jaxpr_recipe 13)) (variant Lambda_binding))))
+                (id (Jax.Partial_eval_tracer 25))))))))
+          (tangent
+           ((id (Jax.Value 663))
+            (value
+             (Tracer
+              (partial_eval_interpreter
+               ((partial_value (Unknown (shaped_array ((dims ())))))
+                (recipe
+                 (((id (Jax.Jaxpr_recipe 14)) (variant Lambda_binding))))
+                (id (Jax.Partial_eval_tracer 26))))))))))))))))
+  (bind (prim Add)
+   (values
+    (((id (Jax.Value 680))
+      (value
+       (Tracer
+        (partial_eval_interpreter
+         ((partial_value (Unknown (shaped_array ((dims ())))))
+          (recipe
+           (((id (Jax.Jaxpr_recipe 21))
+             (variant
+              (Jaxpr_eqn (prim Neg)
+               (tracers_in
+                (((partial_value (Unknown (shaped_array ((dims ())))))
+                  (recipe
+                   (((id (Jax.Jaxpr_recipe 20))
+                     (variant
+                      (Jaxpr_eqn (prim Add)
+                       (tracers_in
+                        (((partial_value (Unknown (shaped_array ((dims ())))))
+                          (recipe
+                           (((id (Jax.Jaxpr_recipe 19))
+                             (variant
+                              (Const_recipe
+                               ((id (Jax.Value 676)) (value (Tensor 0))))))))
+                          (id (Jax.Partial_eval_tracer 36)))
+                         ((partial_value (Unknown (shaped_array ((dims ())))))
+                          (recipe
+                           (((id (Jax.Jaxpr_recipe 18))
+                             (variant
+                              (Jaxpr_eqn (prim Mul)
+                               (tracers_in
+                                (((partial_value
+                                   (Unknown (shaped_array ((dims ())))))
+                                  (recipe
+                                   (((id (Jax.Jaxpr_recipe 16))
+                                     (variant
+                                      (Jaxpr_eqn (prim Mul)
+                                       (tracers_in
+                                        (((partial_value
+                                           (Unknown (shaped_array ((dims ())))))
+                                          (recipe
+                                           (((id (Jax.Jaxpr_recipe 15))
+                                             (variant
+                                              (Const_recipe
+                                               ((id (Jax.Value 667))
+                                                (value
+                                                 (Tensor -0.98999249660044542))))))))
+                                          (id (Jax.Partial_eval_tracer 29)))
+                                         ((partial_value
+                                           (Unknown (shaped_array ((dims ())))))
+                                          (recipe
+                                           (((id (Jax.Jaxpr_recipe 14))
+                                             (variant Lambda_binding))))
+                                          (id (Jax.Partial_eval_tracer 26)))))
+                                       (avals_out (((dims ()))))
+                                       (tracer_refs_out (<opaque>)))))))
+                                  (id (Jax.Partial_eval_tracer 30)))
+                                 ((partial_value
+                                   (Unknown (shaped_array ((dims ())))))
+                                  (recipe
+                                   (((id (Jax.Jaxpr_recipe 17))
+                                     (variant
+                                      (Const_recipe
+                                       ((id (Jax.Value 673))
+                                        (value (Tensor 2))))))))
+                                  (id (Jax.Partial_eval_tracer 33)))))
+                               (avals_out (((dims ()))))
+                               (tracer_refs_out (<opaque>)))))))
+                          (id (Jax.Partial_eval_tracer 34)))))
+                       (avals_out (((dims ())))) (tracer_refs_out (<opaque>)))))))
+                  (id (Jax.Partial_eval_tracer 37)))))
+               (avals_out (((dims ())))) (tracer_refs_out (<opaque>)))))))
+          (id (Jax.Partial_eval_tracer 38)))))))
+     ((id (Jax.Value 663))
+      (value
+       (Tracer
+        (partial_eval_interpreter
+         ((partial_value (Unknown (shaped_array ((dims ())))))
+          (recipe (((id (Jax.Jaxpr_recipe 14)) (variant Lambda_binding))))
+          (id (Jax.Partial_eval_tracer 26))))))))))
+  (bind (prim Add)
+   (values
+    (((id (Jax.Value 681)) (value (Tensor -0.28224001611973443)))
+     ((id (Jax.Value 662))
+      (value
+       (Tracer
+        (partial_eval_interpreter
+         ((partial_value
+           (Known (shaped_array ((dims ())))
+            (const ((id (Jax.Value 661)) (value (Tensor 3))))))
+          (recipe (((id (Jax.Jaxpr_recipe 13)) (variant Lambda_binding))))
+          (id (Jax.Partial_eval_tracer 25))))))))))
+  (bind (prim Add)
+   (values
+    (((id (Jax.Value 684)) (value (Tensor -0.28224001611973443)))
+     ((id (Jax.Value 661)) (value (Tensor 3))))))
+  (tracers_in
+   (((partial_value (Unknown (shaped_array ((dims ())))))
+     (recipe (((id (Jax.Jaxpr_recipe 14)) (variant Lambda_binding))))
+     (id (Jax.Partial_eval_tracer 26)))))
+  (tracer_to_var
+   (((Jax.Partial_eval_tracer 26)
+     ((shaped_array ((dims ()))) (id (Jax.Var 122))))))
+  |}]
 ;;
